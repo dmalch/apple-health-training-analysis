@@ -1,3 +1,9 @@
 # Core: the XML-export route and every analysis script.
 duckdb==1.5.5
+
+# Not imported anywhere in this project, and not removable for that reason:
+# duckdb itself imports pytz when it converts a TIMESTAMPTZ value back into
+# Python, and raises "Required module 'pytz' failed to import" without it.
+# Every table here carries TIMESTAMPTZ columns, so this is a hard runtime
+# dependency that duckdb does not declare for us.
 pytz==2026.3.post1

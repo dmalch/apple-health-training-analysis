@@ -32,7 +32,8 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ```
 
-Зависимости всего две — `duckdb` и `pytz`.
+Зависимости две — `duckdb` и `pytz` (второй нужен самому duckdb, чтобы отдавать
+в Python значения с часовым поясом).
 
 ## 3. Выгрузить данные из Здоровья
 

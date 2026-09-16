@@ -37,7 +37,8 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ```
 
-Two dependencies: `duckdb` and `pytz`. The optional backup route adds three more:
+Two pinned dependencies: `duckdb`, plus `pytz`, which duckdb itself needs to
+hand a `TIMESTAMPTZ` back to Python. The optional backup route adds three more:
 
 ```sh
 ./.venv/bin/pip install -r requirements-sync.txt

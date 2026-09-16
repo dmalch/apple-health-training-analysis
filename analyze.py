@@ -73,7 +73,7 @@ def f(row, key):
 
 
 def load(data_dir, cross_talk=frozenset()):
-    with open(os.path.join(data_dir, "workouts.csv")) as fh:
+    with open(os.path.join(data_dir, "workouts.csv"), encoding="utf-8") as fh:
         workouts = list(csv.DictReader(fh))
     dropped = [w for w in workouts if w.get("source") in DUPLICATE_SOURCES]
     workouts = [w for w in workouts if w.get("source") not in DUPLICATE_SOURCES]
@@ -83,7 +83,7 @@ def load(data_dir, cross_talk=frozenset()):
     daily = []
     dpath = os.path.join(data_dir, "daily_metrics.csv")
     if os.path.exists(dpath):
-        with open(dpath) as fh:
+        with open(dpath, encoding="utf-8") as fh:
             daily = list(csv.DictReader(fh))
     for w in workouts:
         w["_d"] = date.fromisoformat(w["date"])
@@ -98,7 +98,7 @@ def load_strap_days(data_dir, cross_talk=frozenset()):
     if not os.path.exists(path):
         return set()
     days = set()
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             if row["source"] in STRAP_SOURCES and int(row["samples"]) > 50:
                 days.add(row["date"])
@@ -133,11 +133,15 @@ MAX_SAMPLE_GAP_S = 15
 MIN_ZONE_COVERAGE = 0.60
 
 
-def open_db(path):
+def open_db(path, tz="UTC"):
     import duckdb
 
     con = duckdb.connect(path, read_only=True)
-    con.execute("SET TimeZone='Europe/Berlin'")
+    # Every TIMESTAMPTZ renders in this zone, including the start times the
+    # report sorts and groups by, so it is a profile field rather than a
+    # constant. Hard-coding one person's zone here silently shifted every
+    # late-evening session for anybody else.
+    con.execute("SET TimeZone=?", [tz])
     return con
 
 
@@ -169,9 +173,9 @@ def strap_anchor(con):
     return row[0] if row else None
 
 
-def load_db(db_path, cross_talk=frozenset()):
+def load_db(db_path, cross_talk=frozenset(), tz="UTC"):
     """Same shapes `load()` returns, read from DuckDB instead of the CSVs."""
-    con = open_db(db_path)
+    con = open_db(db_path, tz)
     foot = ", ".join(f"'{a}'" for a in sorted(FOOT_ACTIVITIES))
     rows = con.execute(f"""
         SELECT id,
@@ -637,7 +641,15 @@ def method_delta(rows, hr_max, out):
     )
 
 
-def intensity(workouts, out, months=12, hr_max=None, strap_days=None, anchor_note="supplied"):
+def intensity(
+    workouts,
+    out,
+    months=12,
+    hr_max=None,
+    strap_days=None,
+    anchor_note="supplied",
+    from_db=False,
+):
     out.append(h("Intensity distribution"))
     last = workouts[-1]["_d"]
     cutoff = last - timedelta(days=30 * months)
@@ -648,7 +660,6 @@ def intensity(workouts, out, months=12, hr_max=None, strap_days=None, anchor_not
         out.append("_No heart-rate data on recent sessions — intensity can't be assessed._")
         return None
 
-    maxes = sorted((f(w, "max_hr") or 0.0) for w in with_hr)
     if hr_max:
         out.append(f"- Max HR anchor: **{hr_max:.0f} bpm** ({anchor_note})")
     elif strap_days:
@@ -662,11 +673,16 @@ def intensity(workouts, out, months=12, hr_max=None, strap_days=None, anchor_not
             f"they spike on long hikes."
         )
     else:
-        idx = max(int(len(maxes) * 0.99) - 1, 0)
-        hr_max = maxes[idx]
-        out.append(
-            f"- Max HR anchor: **{hr_max:.0f} bpm** (99th pct of session maxima — "
-            f"no strap data available, so this may be inflated by optical spikes)"
+        # No anchor and nothing to derive one from. The previous behaviour here
+        # was to take the 99th percentile of session maxima, which docs/method.md
+        # records as tried and discarded: it came out six beats low, and every
+        # percentage in this report is cut from this one number. A report built
+        # on a guessed anchor is complete, plausible and wrong, so say so instead.
+        raise SystemExit(
+            "No max-HR anchor, and no chest-strap data to derive one from.\n"
+            "Set max_hr in the profile to a measured maximum, or pass --max-hr.\n"
+            "Every zone in this report is a percentage of that number, so guessing "
+            "it would misreport every session rather than fail."
         )
     out.append(
         f"- {len(with_hr)} of {len(recent)} recent sessions carry HR "
@@ -692,8 +708,13 @@ def intensity(workouts, out, months=12, hr_max=None, strap_days=None, anchor_not
     else:
         out.append(
             "- Zones are bucketed from each session's **average** HR — a "
-            "session-level classification, not time in zone. Point --db at a "
-            "DuckDB database for real per-sample zone times."
+            "session-level classification, not time in zone. "
+            + (
+                "No session had heart-rate samples covering enough of its "
+                "duration to compute real time in zone."
+                if from_db
+                else "Point --db at a DuckDB database for real per-sample zone times."
+            )
         )
 
     strength_h = (
@@ -1229,7 +1250,9 @@ def main():
 
     con = None
     if use_db:
-        con, workouts, daily, dropped, strap_days = load_db(db_path, cross_talk)
+        con, workouts, daily, dropped, strap_days = load_db(
+            db_path, cross_talk, profile["timezone"]
+        )
     else:
         workouts, daily, dropped = load(data_dir, cross_talk)
         strap_days = load_strap_days(data_dir, cross_talk)
@@ -1287,7 +1310,9 @@ def main():
     overview(workouts, out)
     activity_mix(workouts, out, args.months)
     consistency(workouts, out, args.months)
-    hr_max = intensity(workouts, out, args.months, hr_max, strap_days, anchor_note)
+    hr_max = intensity(
+        workouts, out, args.months, hr_max, strap_days, anchor_note, from_db=con is not None
+    )
     strength_volume(workouts, out)
     aerobic_progression(workouts, out)
     running_detail(workouts, out, args.months, hr_max)

@@ -130,3 +130,46 @@ class StructuredBlockTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowStatsTest(unittest.TestCase):
+    """window_stats must survive a block whose heart-rate stream has holes.
+
+    `hrs` being non-empty says nothing about the first 15 s or the last 20 s of
+    the window, and statistics.mean([]) raises. One rep with a dropout at its
+    boundary used to abort the entire report.
+    """
+
+    def stream(self, offsets_seconds, bpm=150):
+        return [(BASE + datetime.timedelta(seconds=s), bpm) for s in offsets_seconds]
+
+    def test_a_block_whose_stream_starts_late_does_not_crash(self):
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(minutes=4)
+        # First sample lands 30 s in, so the "first 15 s" slice is empty.
+        st = ai.window_stats(t0, t1, [], [], self.stream(range(30, 240, 5)))
+        self.assertIsNone(st["start_hr"])
+        self.assertIsNotNone(st["end_hr"])
+        self.assertIsNotNone(st["avg_hr"])
+
+    def test_a_block_whose_stream_stops_early_does_not_crash(self):
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(minutes=4)
+        # Last sample is 60 s before the end, so the "last 20 s" slice is empty.
+        st = ai.window_stats(t0, t1, [], [], self.stream(range(0, 180, 5)))
+        self.assertIsNotNone(st["start_hr"])
+        self.assertIsNone(st["end_hr"])
+
+    def test_a_block_with_no_samples_at_all_reports_nothing_rather_than_raising(self):
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(minutes=4)
+        st = ai.window_stats(t0, t1, [], [], [])
+        for key in ("avg_hr", "max_hr", "min_hr", "start_hr", "end_hr"):
+            self.assertIsNone(st[key], key)
+
+    def test_a_complete_stream_still_reports_both_ends(self):
+        t0 = BASE
+        t1 = BASE + datetime.timedelta(minutes=4)
+        st = ai.window_stats(t0, t1, [], [], self.stream(range(0, 245, 5)))
+        self.assertAlmostEqual(st["start_hr"], 150.0)
+        self.assertAlmostEqual(st["end_hr"], 150.0)
