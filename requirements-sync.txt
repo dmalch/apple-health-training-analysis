@@ -1,5 +1,5 @@
 # Only needed for the phone-backup route (the health-sync skill).
 # The XML-export route does not use any of these.
-pymobiledevice3==11.3.1
+pymobiledevice3==11.12.5
 pyiosbackup==0.2.4
 gpxpy==1.6.2
