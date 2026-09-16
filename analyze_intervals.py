@@ -34,6 +34,7 @@ from datetime import timedelta
 import duckdb
 
 import athlete_profile
+from analyze import MAX_SAMPLE_GAP_S
 
 EARTH_R = 6371008.8
 
@@ -61,6 +62,11 @@ def fmt_dur(seconds):
         return "-"
     seconds = round(seconds)
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def mean_or_none(values):
+    """Mean of a possibly empty sequence. Empty means "no answer", not an error."""
+    return statistics.mean(values) if values else None
 
 
 def rolling_median(values, window):
@@ -391,22 +397,18 @@ def window_stats(t0, t1, times, cum, hr_by_t, above=None):
         secs_above = 0.0
         for (ta, ba), (tb, _) in zip(inside, inside[1:], strict=False):
             gap = (tb - ta).total_seconds()
-            if ba >= above and gap <= 10:
+            if ba >= above and gap <= MAX_SAMPLE_GAP_S:
                 secs_above += gap
 
     return {
         "dur": dur,
         "dist_km": dist / 1000 if dist else None,
         "pace": (dur / 60) / (dist / 1000) if dist and dist > 50 else None,
-        "avg_hr": statistics.mean(hrs) if hrs else None,
+        "avg_hr": mean_or_none(hrs),
         "max_hr": max(hrs) if hrs else None,
         "min_hr": min(hrs) if hrs else None,
-        "start_hr": statistics.mean([b for t, b in inside if t <= t0 + timedelta(seconds=15)])
-        if hrs
-        else None,
-        "end_hr": statistics.mean([b for t, b in inside if t >= t1 - timedelta(seconds=20)])
-        if hrs
-        else None,
+        "start_hr": mean_or_none([b for t, b in inside if t <= t0 + timedelta(seconds=15)]),
+        "end_hr": mean_or_none([b for t, b in inside if t >= t1 - timedelta(seconds=20)]),
         "secs_above": secs_above,
         "n_hr": len(hrs),
     }
@@ -516,7 +518,7 @@ def report_blocks(bounds, times, cum, hr_by_t, max_hr, out):
             secs = 0
             for (t1, b1), (t2, _) in zip(span, span[1:], strict=False):
                 gap = (t2 - t1).total_seconds()
-                if b1 >= thr and gap <= 10:
+                if b1 >= thr and gap <= MAX_SAMPLE_GAP_S:
                     secs += gap
             print(f"  >= {pct * 100:.0f}% max ({thr:.0f} bpm): {fmt_dur(secs)}", file=out)
     return rows
@@ -558,7 +560,7 @@ def main():
     tz = args.tz or athlete_profile.field(profile, "timezone") or "UTC"
 
     con = duckdb.connect(db, read_only=True)
-    con.execute(f"SET TimeZone='{tz}'")
+    con.execute("SET TimeZone=?", [tz])
 
     date = args.date
     if not date and not args.workout:

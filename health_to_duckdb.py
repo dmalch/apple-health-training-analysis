@@ -24,6 +24,7 @@ Needs the duckdb module (see .venv). Everything else is stdlib.
 
 import argparse
 import csv
+import datetime
 import os
 import shutil
 import sys
@@ -49,6 +50,9 @@ STAT_SHORTCUTS = {
 }
 
 GPX_NS = "{http://www.topografix.com/GPX/1/1}"
+
+# How Apple writes timestamps in export.xml, e.g. "2026-09-03 09:35:51 +0200".
+APPLE_DATE_FMT = "%Y-%m-%d %H:%M:%S %z"
 
 
 # ------------------------------------------------------------------ utilities
@@ -142,7 +146,7 @@ class Sink:
         self.path = os.path.join(stage_dir, f"{name}.csv")
         # Held open for the lifetime of the Sink and closed in close(); the
         # writer is used across many calls, so a context manager does not fit.
-        self._fh = open(self.path, "w", newline="")  # noqa: SIM115
+        self._fh = open(self.path, "w", newline="", encoding="utf-8")  # noqa: SIM115
         self._w = csv.writer(self._fh)
         self._w.writerow(columns)
         self.rows = 0
@@ -245,178 +249,237 @@ def stream_xml(source, stage_dir, progress_every=1_000_000):
         "export_meta": Sink(stage_dir, "export_meta", ["key", "value"]),
     }
 
-    fh = open_export(source)
-    context = ET.iterparse(fh, events=("start", "end"))
-    _, root = next(context)
-    for key, value in root.attrib.items():
-        sinks["export_meta"].write([key, value])
+    # The sinks and the input stream are closed whatever happens: a truncated
+    # export used to leave buffered writers unflushed and partial CSVs in the
+    # staging directory, which a later --stage-dir run would load as complete.
+    fh = None
+    try:
+        fh = open_export(source)
+        context = ET.iterparse(fh, events=("start", "end"))
+        _, root = next(context)
+        for key, value in root.attrib.items():
+            sinks["export_meta"].write([key, value])
 
-    record_id = 0
-    workout_id = 0
-    depth = 1
-    started = time.time()
+        record_id = 0
+        workout_id = 0
+        depth = 1
+        started = time.time()
 
-    for event, elem in context:
-        if event == "start":
-            depth += 1
-            continue
-        depth -= 1
-        # Children are reached on the way out of their parent; only act on
-        # top-level elements, then clear the whole subtree.
-        if depth != 1:
-            continue
+        for event, elem in context:
+            if event == "start":
+                depth += 1
+                continue
+            depth -= 1
+            # Children are reached on the way out of their parent; only act on
+            # top-level elements, then clear the whole subtree.
+            if depth != 1:
+                continue
 
-        tag = elem.tag
+            tag = elem.tag
 
-        if tag == "Record":
-            record_id += 1
-            raw = elem.get("value")
-            sinks["records"].write(
-                [
-                    record_id,
-                    elem.get("type"),
-                    elem.get("sourceName"),
-                    elem.get("sourceVersion"),
-                    elem.get("device"),
-                    elem.get("unit"),
-                    elem.get("creationDate"),
-                    elem.get("startDate"),
-                    elem.get("endDate"),
-                    raw if to_float(raw) is not None else "",
-                    "" if to_float(raw) is not None else (raw or ""),
-                ]
-            )
-            for md in elem.findall("MetadataEntry"):
-                sinks["record_metadata"].write([record_id, md.get("key"), md.get("value")])
-            if record_id % progress_every == 0:
-                rate = record_id / max(time.time() - started, 1e-9)
-                print(f"  {record_id:>12,} records  ({rate:,.0f}/s)", file=sys.stderr)
-
-        elif tag == "Workout":
-            workout_id += 1
-            stats = {}
-            for st in elem.findall("WorkoutStatistics"):
-                stype = st.get("type")
-                unit = st.get("unit")
-                sinks["workout_statistics"].write(
+            if tag == "Record":
+                record_id += 1
+                raw = elem.get("value")
+                sinks["records"].write(
                     [
-                        workout_id,
-                        stype,
-                        st.get("startDate"),
-                        st.get("endDate"),
-                        st.get("average"),
-                        st.get("minimum"),
-                        st.get("maximum"),
-                        st.get("sum"),
-                        unit,
+                        record_id,
+                        elem.get("type"),
+                        elem.get("sourceName"),
+                        elem.get("sourceVersion"),
+                        elem.get("device"),
+                        elem.get("unit"),
+                        elem.get("creationDate"),
+                        elem.get("startDate"),
+                        elem.get("endDate"),
+                        raw if to_float(raw) is not None else "",
+                        "" if to_float(raw) is not None else (raw or ""),
                     ]
                 )
-                short = STAT_SHORTCUTS.get(stype)
-                if short:
-                    stats[short] = (st, unit)
+                for md in elem.findall("MetadataEntry"):
+                    sinks["record_metadata"].write([record_id, md.get("key"), md.get("value")])
+                if record_id % progress_every == 0:
+                    rate = record_id / max(time.time() - started, 1e-9)
+                    print(f"  {record_id:>12,} records  ({rate:,.0f}/s)", file=sys.stderr)
 
-            meta = {}
-            for md in elem.findall("MetadataEntry"):
-                meta[md.get("key")] = md.get("value")
-                sinks["workout_metadata"].write([workout_id, md.get("key"), md.get("value")])
+            elif tag == "Workout":
+                workout_id += 1
+                stats = {}
+                for st in elem.findall("WorkoutStatistics"):
+                    stype = st.get("type")
+                    unit = st.get("unit")
+                    sinks["workout_statistics"].write(
+                        [
+                            workout_id,
+                            stype,
+                            st.get("startDate"),
+                            st.get("endDate"),
+                            st.get("average"),
+                            st.get("minimum"),
+                            st.get("maximum"),
+                            st.get("sum"),
+                            unit,
+                        ]
+                    )
+                    short = STAT_SHORTCUTS.get(stype)
+                    if short:
+                        # Several rows of the same kind is the normal case for a
+                        # multi-activity workout, so they accumulate here and are
+                        # aggregated below. Keeping only the last one silently
+                        # reported the final segment as if it were the session.
+                        stats.setdefault(short, []).append((st, unit))
 
-            for ev in elem.findall("WorkoutEvent"):
-                sinks["workout_events"].write(
+                meta = {}
+                for md in elem.findall("MetadataEntry"):
+                    meta[md.get("key")] = md.get("value")
+                    sinks["workout_metadata"].write([workout_id, md.get("key"), md.get("value")])
+
+                for ev in elem.findall("WorkoutEvent"):
+                    sinks["workout_events"].write(
+                        [
+                            workout_id,
+                            ev.get("type"),
+                            ev.get("date"),
+                            to_min(ev.get("duration"), ev.get("durationUnit")),
+                        ]
+                    )
+
+                route_file = ""
+                for wr in elem.findall("WorkoutRoute"):
+                    for fr in wr.findall("FileReference"):
+                        route_file = os.path.basename(fr.get("path") or "")
+
+                # Distance and energy live on the element in old exports and in
+                # <WorkoutStatistics> children in new ones. Prefer the statistic.
+                if "distance_km" in stats:
+                    distance = stat_total(stats["distance_km"], to_km)
+                else:
+                    distance = to_km(elem.get("totalDistance"), elem.get("totalDistanceUnit"))
+
+                if "active_kcal" in stats:
+                    active = stat_total(stats["active_kcal"], to_kcal)
+                else:
+                    active = to_kcal(
+                        elem.get("totalEnergyBurned"), elem.get("totalEnergyBurnedUnit")
+                    )
+
+                basal = None
+                if "basal_kcal" in stats:
+                    basal = stat_total(stats["basal_kcal"], to_kcal)
+
+                steps = None
+                if "steps" in stats:
+                    steps = stat_total(stats["steps"], lambda v, _unit: to_float(v))
+
+                avg_hr = max_hr = min_hr = None
+                if "hr" in stats:
+                    rows = stats["hr"]
+                    avg_hr = stat_weighted_average(rows)
+                    max_hr = stat_extreme(rows, "maximum", max)
+                    min_hr = stat_extreme(rows, "minimum", min)
+
+                indoor = meta.get("HKIndoorWorkout")
+                indoor = "" if indoor is None else ("true" if indoor in ("1", "1.0") else "false")
+
+                activity = (elem.get("workoutActivityType") or "").replace(
+                    "HKWorkoutActivityType", ""
+                )
+                sinks["workouts"].write(
                     [
                         workout_id,
-                        ev.get("type"),
-                        ev.get("date"),
-                        to_min(ev.get("duration"), ev.get("durationUnit")),
+                        activity,
+                        to_min(elem.get("duration"), elem.get("durationUnit")),
+                        elem.get("sourceName"),
+                        elem.get("sourceVersion"),
+                        elem.get("device"),
+                        elem.get("creationDate"),
+                        elem.get("startDate"),
+                        elem.get("endDate"),
+                        distance,
+                        active,
+                        basal,
+                        steps,
+                        avg_hr,
+                        max_hr,
+                        min_hr,
+                        indoor,
+                        route_file,
                     ]
                 )
 
-            route_file = ""
-            for wr in elem.findall("WorkoutRoute"):
-                for fr in wr.findall("FileReference"):
-                    route_file = os.path.basename(fr.get("path") or "")
+            elif tag == "ActivitySummary":
+                sinks["activity_summary"].write(
+                    [
+                        elem.get("dateComponents"),
+                        elem.get("activeEnergyBurned"),
+                        elem.get("activeEnergyBurnedGoal"),
+                        elem.get("activeEnergyBurnedUnit"),
+                        elem.get("appleExerciseTime"),
+                        elem.get("appleExerciseTimeGoal"),
+                        elem.get("appleStandHours"),
+                        elem.get("appleStandHoursGoal"),
+                    ]
+                )
 
-            # Distance and energy live on the element in old exports and in
-            # <WorkoutStatistics> children in new ones. Prefer the statistic.
-            if "distance_km" in stats:
-                st, unit = stats["distance_km"]
-                distance = to_km(st.get("sum"), unit)
-            else:
-                distance = to_km(elem.get("totalDistance"), elem.get("totalDistanceUnit"))
+            elif tag in ("ExportDate", "Me"):
+                for key, value in elem.attrib.items():
+                    sinks["export_meta"].write([f"{tag}.{key}", value])
 
-            if "active_kcal" in stats:
-                st, unit = stats["active_kcal"]
-                active = to_kcal(st.get("sum"), unit)
-            else:
-                active = to_kcal(elem.get("totalEnergyBurned"), elem.get("totalEnergyBurnedUnit"))
+            elem.clear()
+            root.clear()
 
-            basal = None
-            if "basal_kcal" in stats:
-                st, unit = stats["basal_kcal"]
-                basal = to_kcal(st.get("sum"), unit)
-
-            steps = None
-            if "steps" in stats:
-                steps = to_float(stats["steps"][0].get("sum"))
-
-            avg_hr = max_hr = min_hr = None
-            if "hr" in stats:
-                st, _ = stats["hr"]
-                avg_hr = to_float(st.get("average"))
-                max_hr = to_float(st.get("maximum"))
-                min_hr = to_float(st.get("minimum"))
-
-            indoor = meta.get("HKIndoorWorkout")
-            indoor = "" if indoor is None else ("true" if indoor in ("1", "1.0") else "false")
-
-            activity = (elem.get("workoutActivityType") or "").replace("HKWorkoutActivityType", "")
-            sinks["workouts"].write(
-                [
-                    workout_id,
-                    activity,
-                    to_min(elem.get("duration"), elem.get("durationUnit")),
-                    elem.get("sourceName"),
-                    elem.get("sourceVersion"),
-                    elem.get("device"),
-                    elem.get("creationDate"),
-                    elem.get("startDate"),
-                    elem.get("endDate"),
-                    distance,
-                    active,
-                    basal,
-                    steps,
-                    avg_hr,
-                    max_hr,
-                    min_hr,
-                    indoor,
-                    route_file,
-                ]
-            )
-
-        elif tag == "ActivitySummary":
-            sinks["activity_summary"].write(
-                [
-                    elem.get("dateComponents"),
-                    elem.get("activeEnergyBurned"),
-                    elem.get("activeEnergyBurnedGoal"),
-                    elem.get("activeEnergyBurnedUnit"),
-                    elem.get("appleExerciseTime"),
-                    elem.get("appleExerciseTimeGoal"),
-                    elem.get("appleStandHours"),
-                    elem.get("appleStandHoursGoal"),
-                ]
-            )
-
-        elif tag in ("ExportDate", "Me"):
-            for key, value in elem.attrib.items():
-                sinks["export_meta"].write([f"{tag}.{key}", value])
-
-        elem.clear()
-        root.clear()
-
-    fh.close()
-    for sink in sinks.values():
-        sink.close()
+    finally:
+        if fh is not None:
+            fh.close()
+        for sink in sinks.values():
+            sink.close()
     return sinks
+
+
+def stat_seconds(st):
+    """How long one WorkoutStatistics row covers, in seconds, never below 1.
+
+    Mirrors `greatest(epoch(end_date) - epoch(start_date), 1)` on the backup
+    route. An unparseable or missing date falls back to 1, which makes the
+    weighted mean degrade to a plain mean rather than vanish.
+    """
+    try:
+        start = datetime.datetime.strptime(st.get("startDate"), APPLE_DATE_FMT)
+        end = datetime.datetime.strptime(st.get("endDate"), APPLE_DATE_FMT)
+    except (TypeError, ValueError):
+        return 1.0
+    return max((end - start).total_seconds(), 1.0)
+
+
+def stat_total(rows, convert):
+    """Sum across every statistics row of one kind, or None if none carry a sum."""
+    values = [convert(st.get("sum"), unit) for st, unit in rows]
+    values = [v for v in values if v is not None]
+    return sum(values) if values else None
+
+
+def stat_extreme(rows, key, pick):
+    values = [to_float(st.get(key)) for st, _ in rows]
+    values = [v for v in values if v is not None]
+    return pick(values) if values else None
+
+
+def stat_weighted_average(rows):
+    """Duration-weighted mean across the statistics rows of one kind.
+
+    A workout can hold several activities, each writing its own row. Taking the
+    last one -- or the largest -- reads about 20 bpm high on interval sessions,
+    because the hard bouts are short and the recoveries are not. The backup
+    route weights by activity length; so does this.
+    """
+    numerator = denominator = 0.0
+    for st, _ in rows:
+        average = to_float(st.get("average"))
+        if average is None:
+            continue
+        seconds = stat_seconds(st)
+        numerator += average * seconds
+        denominator += seconds
+    return numerator / denominator if denominator else None
 
 
 def gpx_ext_value(ext, tag):
@@ -686,13 +749,13 @@ WITH point AS (
     SELECT local_date, type, avg(value) AS v
     FROM records
     WHERE type IN ('RestingHeartRate','HeartRateVariabilitySDNN','VO2Max',
-                   'BodyMass','WalkingHeartRateAverage','RespiratoryRate')
+                   'BodyMass','RespiratoryRate')
     GROUP BY ALL
 ),
 summed AS (
     SELECT local_date, type, sum(value) AS v
     FROM records
-    WHERE type IN ('ActiveEnergyBurned','AppleExerciseTime','AppleStandTime')
+    WHERE type IN ('ActiveEnergyBurned','AppleExerciseTime')
     GROUP BY ALL
 ),
 per_source AS (
@@ -756,12 +819,21 @@ def main():
         with_routes = rs.rows > 0
 
     print(f"loading into {db_path}", file=sys.stderr)
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    con = duckdb.connect(db_path)
-    load(con, stage_dir, with_routes)
-    con.execute(VIEWS)
-    con.close()
+    tmp_db = db_path + ".new"
+    for stale in (tmp_db, tmp_db + ".wal"):
+        if os.path.exists(stale):
+            os.remove(stale)
+    con = duckdb.connect(tmp_db)
+    try:
+        load(con, stage_dir, with_routes)
+        con.execute(VIEWS)
+    finally:
+        con.close()
+    # Only now is the previous database expendable. Anything above raising
+    # leaves it exactly as it was.
+    if os.path.exists(db_path + ".wal"):
+        os.remove(db_path + ".wal")
+    os.replace(tmp_db, db_path)
 
     if not args.keep_staging:
         shutil.rmtree(stage_dir, ignore_errors=True)

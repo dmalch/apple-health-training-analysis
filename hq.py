@@ -58,7 +58,7 @@ def main():
     tz = args.tz or athlete_profile.field(profile, "timezone") or "UTC"
 
     con = duckdb.connect(db, read_only=True)
-    con.execute(f"SET TimeZone='{tz}'")
+    con.execute("SET TimeZone=?", [tz])
 
     if args.tables:
         sql = (
@@ -66,9 +66,22 @@ def main():
             "WHERE table_schema='main' ORDER BY table_type, table_name"
         )
     elif args.schema:
-        sql = f"DESCRIBE {args.schema}"
+        # An identifier cannot be a bound parameter, so it is looked up
+        # rather than interpolated: --schema is a name from this database, not
+        # a fragment of SQL to append.
+        known = [
+            r[0]
+            for r in con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+            ).fetchall()
+        ]
+        if args.schema not in known:
+            raise SystemExit(
+                f"no table or view named {args.schema!r}. Known: {', '.join(sorted(known))}"
+            )
+        sql = f'DESCRIBE "{args.schema}"'
     elif args.file:
-        with open(args.file) as fh:
+        with open(args.file, encoding="utf-8") as fh:
             sql = fh.read()
     elif args.sql:
         sql = args.sql

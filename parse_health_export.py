@@ -117,6 +117,44 @@ def to_float(value):
         return None
 
 
+# How Apple writes timestamps in export.xml, e.g. "2026-09-03 09:35:51 +0200".
+APPLE_DATE_FMT = "%Y-%m-%d %H:%M:%S %z"
+
+
+def stat_seconds(el):
+    """How long one WorkoutStatistics element covers, in seconds, never below 1."""
+    try:
+        start = datetime.strptime(el.get("startDate"), APPLE_DATE_FMT)
+        end = datetime.strptime(el.get("endDate"), APPLE_DATE_FMT)
+    except (TypeError, ValueError):
+        return 1.0
+    return max((end - start).total_seconds(), 1.0)
+
+
+def weighted_average(elements):
+    """Duration-weighted mean of the `average` attribute across several rows.
+
+    `to_float(...) or previous` was wrong twice over: it discarded a legitimate
+    0.0, and across several rows it kept whichever came last rather than
+    combining them.
+    """
+    numerator = denominator = 0.0
+    for el in elements:
+        value = to_float(el.get("average"))
+        if value is None:
+            continue
+        seconds = stat_seconds(el)
+        numerator += value * seconds
+        denominator += seconds
+    return numerator / denominator if denominator else None
+
+
+def extreme(elements, key, pick):
+    values = [to_float(el.get(key)) for el in elements]
+    values = [v for v in values if v is not None]
+    return pick(values) if values else None
+
+
 def to_km(value, unit):
     """Normalise a distance to km."""
     v = to_float(value)
@@ -277,25 +315,46 @@ def handle_workout(elem):
     avg_hr = max_hr = min_hr = None
     indoor = None
 
+    # A workout Apple split into several activities writes one
+    # <WorkoutStatistics> per activity, so these accumulate and are combined
+    # afterwards. Letting the last one win reported the final segment as if it
+    # were the whole session: a distance covering one leg, and an average heart
+    # rate biased by the short hard bouts against the long easy ones.
+    hr_rows = []
+    distances = []
+    actives = []
+    basals = []
+
     for child in elem:
         if child.tag == "WorkoutStatistics":
             key = WORKOUT_STAT_KEYS.get(child.get("type"))
             if key == "hr":
-                avg_hr = to_float(child.get("average")) or avg_hr
-                max_hr = to_float(child.get("maximum")) or max_hr
-                min_hr = to_float(child.get("minimum")) or min_hr
+                hr_rows.append(child)
             elif key == "distance_km":
                 d = to_km(child.get("sum"), child.get("unit"))
                 if d is not None:
-                    distance_km = d
+                    distances.append(d)
             elif key == "active_kcal":
                 v = to_float(child.get("sum"))
                 if v is not None:
-                    active_kcal = v
+                    actives.append(v)
             elif key == "basal_kcal":
-                basal_kcal = to_float(child.get("sum"))
+                v = to_float(child.get("sum"))
+                if v is not None:
+                    basals.append(v)
         elif child.tag == "MetadataEntry" and child.get("key") == "HKIndoorWorkout":
             indoor = child.get("value") in ("1", "true", "YES")
+
+    if distances:
+        distance_km = sum(distances)
+    if actives:
+        active_kcal = sum(actives)
+    if basals:
+        basal_kcal = sum(basals)
+    if hr_rows:
+        avg_hr = weighted_average(hr_rows)
+        max_hr = extreme(hr_rows, "maximum", max)
+        min_hr = extreme(hr_rows, "minimum", min)
 
     pace = None
     speed = None
@@ -332,7 +391,7 @@ def handle_workout(elem):
 def write_workouts(workouts, out_dir):
     path = os.path.join(out_dir, "workouts.csv")
     workouts.sort(key=lambda r: r["start"])
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=WORKOUT_FIELDS)
         writer.writeheader()
         writer.writerows(workouts)
@@ -342,7 +401,7 @@ def write_workouts(workouts, out_dir):
 def write_daily(daily_points, daily_sums, out_dir):
     path = os.path.join(out_dir, "daily_metrics.csv")
     days = sorted(set(daily_points) | set(daily_sums))
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=DAILY_FIELDS)
         writer.writeheader()
         for day in days:

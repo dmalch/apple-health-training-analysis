@@ -187,3 +187,94 @@ class DeviceGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ZoneValidationTest(unittest.TestCase):
+    """Every rejection here prevents minutes vanishing from a report in silence."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="zones-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def load(self, zones_toml):
+        path = self.dir / "z.toml"
+        path.write_text(textwrap.dedent(MINIMAL + zones_toml))
+        return athlete_profile.load(path=path)
+
+    TWO_GOOD = """
+    [[zones]]
+    name = "easy"
+    lo = 0.0
+    hi = 0.7
+    [[zones]]
+    name = "hard"
+    lo = 0.7
+    hi = 9.99
+    """
+
+    def test_two_touching_bands_are_accepted(self):
+        p = self.load(self.TWO_GOOD)
+        self.assertEqual([z[0] for z in p["zones"]], ["easy", "hard"])
+
+    def test_a_band_written_backwards_is_refused(self):
+        # This used to pass validation: the gap check compared hi=0.6 of the
+        # inverted band against lo=0.6 of the next and saw no gap. Downstream,
+        # `lo <= frac < hi` could never fire, so those minutes were counted
+        # nowhere and the totals quietly came out short.
+        body = """
+        [[zones]]
+        name = "backwards"
+        lo = 0.9
+        hi = 0.6
+        [[zones]]
+        name = "rest"
+        lo = 0.6
+        hi = 9.99
+        """
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(body)
+        self.assertIn("backwards", str(e.exception))
+
+    def test_overlapping_bands_are_refused(self):
+        body = """
+        [[zones]]
+        name = "a"
+        lo = 0.0
+        hi = 0.8
+        [[zones]]
+        name = "b"
+        lo = 0.7
+        hi = 9.99
+        """
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(body)
+        self.assertIn("twice", str(e.exception))
+
+    def test_a_first_band_that_does_not_start_at_zero_is_refused(self):
+        body = """
+        [[zones]]
+        name = "a"
+        lo = 0.5
+        hi = 0.7
+        [[zones]]
+        name = "b"
+        lo = 0.7
+        hi = 9.99
+        """
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(body)
+        self.assertIn("below that", str(e.exception))
+
+    def test_a_zero_width_band_is_refused(self):
+        body = """
+        [[zones]]
+        name = "flat"
+        lo = 0.0
+        hi = 0.0
+        [[zones]]
+        name = "rest"
+        lo = 0.0
+        hi = 9.99
+        """
+        with self.assertRaises(athlete_profile.ProfileError):
+            self.load(body)

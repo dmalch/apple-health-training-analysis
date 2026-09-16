@@ -48,7 +48,7 @@ venvPath = "."
 venv = ".venv"
 typeCheckingMode = "basic"
 reportMissingImports = "error"
-# duckdb and pytz ship no stubs worth trusting; the errors they raise are noise.
+# duckdb ships no stubs worth trusting; the errors they raise are noise.
 reportMissingTypeStubs = "none"
 # These three fire almost exclusively on untyped external data, where "a value
 # or nothing" is the shape of the source rather than a defect: duckdb's

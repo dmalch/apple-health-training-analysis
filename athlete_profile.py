@@ -169,22 +169,51 @@ def load(name=None, path=None):
 
 
 def parse_zones(zones, src):
+    """Validate custom zone bands, or hand back the default five.
+
+    Every check here exists because the failure it prevents is silent. A band
+    written the wrong way round, a gap between two bands, or a first band that
+    does not start at zero all produce a report where some minutes belong to no
+    zone at all -- the totals simply come out short, with no error anywhere.
+    """
     if zones is None:
         return [tuple(z) for z in DEFAULT_ZONES]
     if not isinstance(zones, list) or not zones:
         raise ProfileError(f"{src}: zones must be a non-empty array of tables")
+
     out = []
     for i, z in enumerate(zones):
         try:
             out.append((str(z["name"]), float(z["lo"]), float(z["hi"])))
         except (TypeError, KeyError, ValueError) as exc:
             raise ProfileError(f"{src}: zones[{i}] needs name, lo and hi -- {exc}") from exc
+
+    for name, lo, hi in out:
+        if not lo < hi:
+            raise ProfileError(
+                f"{src}: zone {name!r} has lo {lo} and hi {hi}. A band that does not "
+                "run upwards can never match a sample, so its time would be counted "
+                "in no zone at all."
+            )
+
     for (na, _, hi), (nb, lo, _) in zip(out, out[1:], strict=False):
-        if abs(hi - lo) > 1e-9:
+        if lo < hi - 1e-9:
+            raise ProfileError(
+                f"{src}: zone {nb!r} starts at {lo}, below where {na!r} ends ({hi}). "
+                "Overlapping bands would count the same minute twice."
+            )
+        if lo > hi + 1e-9:
             raise ProfileError(
                 f"{src}: zones leave a gap between {na!r} (hi {hi}) and {nb!r} (lo {lo}); "
                 "time in that band would be counted in no zone at all"
             )
+
+    if out[0][1] > 1e-9:
+        raise ProfileError(
+            f"{src}: the first zone starts at {out[0][1]}, not 0. Every heart rate "
+            "below that would be counted in no zone at all."
+        )
+
     return out
 
 

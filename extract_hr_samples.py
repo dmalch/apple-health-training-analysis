@@ -95,7 +95,7 @@ def main():
     for day in sorted(samples):
         rows = sorted(samples[day])
         path = os.path.join(out_dir, f"hr_{day}.csv")
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["time", "bpm", "source"])
             for dt, bpm, src in rows:
