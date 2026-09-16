@@ -1,0 +1,56 @@
+# Packaging is deliberately absent: these are scripts you run out of a clone,
+# not a library you install. This file exists for the linters.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",
+    "F",    # pyflakes
+    "I",    # import order
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "A",    # shadowing builtins and stdlib module names
+    "C4",   # comprehensions
+    "SIM",  # simplifications
+    "RUF",
+]
+ignore = [
+    "E501",    # line length is checked by the formatter, not the linter
+    "SIM108",  # ternaries are not always clearer than an if/else
+    # The reports are typeset output: en dashes and multiplication signs in
+    # their format strings are deliberate, not mistyped ASCII.
+    "RUF001",
+    # itertools.pairwise and unpacking are tidier, but rewriting working,
+    # output-verified numeric code for style is a bad trade.
+    "RUF007",
+    "RUF005",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The tests build deliberately awkward fixtures and shadow names to do it.
+"test_*.py" = ["E741"]
+
+[tool.pyright]
+include = ["."]
+exclude = ["**/__pycache__", ".venv", "data", "data-*"]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
+reportMissingImports = "error"
+# duckdb and pytz ship no stubs worth trusting; the errors they raise are noise.
+reportMissingTypeStubs = "none"
+# These three fire almost exclusively on untyped external data, where "a value
+# or nothing" is the shape of the source rather than a defect: duckdb's
+# fetchone() is tuple | None on every call, and a CSV cell is str | None by
+# nature. Leaving them as errors would mean hundreds of assertions that restate
+# what the surrounding guard already establishes. Everything else stays an
+# error, so undefined names, bad attribute access and wrong call signatures --
+# the failures that actually stop a script at startup -- are still caught.
+reportOptionalSubscript = "none"
+reportOptionalOperand = "none"
+reportArgumentType = "none"

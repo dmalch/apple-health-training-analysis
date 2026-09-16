@@ -1,0 +1,21 @@
+# Health data and everything derived from it. Never commit any of this.
+data/
+data-*/
+*.zip
+export.xml
+Export.xml
+_staging/
+
+# Profiles hold a person's max heart rate, gym labels and device UDID.
+# Only the template is tracked.
+profiles/*.toml
+!profiles/example.toml
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# macOS
+.DS_Store

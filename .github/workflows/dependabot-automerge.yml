@@ -1,0 +1,29 @@
+name: Dependabot auto-merge
+
+on: pull_request
+
+# A workflow triggered by Dependabot gets a read-only GITHUB_TOKEN by default.
+# Without this block the job runs, reports success and merges nothing, which is
+# the usual reason "auto-merge is set up" but no PR ever lands.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Auto-merge waits for the required checks in the branch ruleset, so this
+      # queues the merge rather than performing it. A major bump is left open on
+      # purpose: it is the one case worth reading before it lands.
+      - if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,32 @@
+version: 2
+
+updates:
+  # Python. Versions are pinned exactly in requirements*.txt, which is what gives
+  # Dependabot something to bump; unpinned requirements produce no PRs at all.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR a week for all the routine bumps. Without grouping, five pinned
+      # dependencies mean five PRs, which is how a repo people check monthly ends
+      # up with a permanently red inbox.
+      python-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "ci"

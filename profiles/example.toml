@@ -1,0 +1,144 @@
+# ---------------------------------------------------------------------------
+# A profile is one person. Copy this file to profiles/<yourname>.toml, edit it,
+# and pass --profile <yourname> to every script.
+#
+# Everything here is personal for a reason. Apple's activity labels do not mean
+# the same thing on two watches: the same `CrossTraining` value is a barbell
+# class for one person and a spin class for the next, and the same
+# `HighIntensityIntervalTraining` is a studio class for one and a 2021 phone-app
+# workout for another. Code cannot know which. Neither can it know your max
+# heart rate, and every zone below is cut as a percentage of that one number --
+# so an anchor borrowed from somebody else does not fail loudly, it quietly
+# reports the wrong zone for every session you have ever recorded.
+#
+# Only profiles/example.toml is tracked by git. Your own profile is ignored,
+# because your max HR and your gym's name are yours.
+# ---------------------------------------------------------------------------
+
+# Free text, used in report headers. Defaults to the filename.
+name = "Example"
+
+# IANA time zone of the phone that produced the export. Every timestamp is
+# stored with an offset, but the wall clock -- which day a 23:40 session belongs
+# to, which week it lands in -- is resolved in this zone. Getting it wrong moves
+# late-evening sessions to the following day.
+timezone = "Europe/Berlin"
+
+# Where the CSVs and the database live. Keep one directory per person: nothing
+# inside a database says whose body it came from.
+data_dir = "data"
+db = "data/health.duckdb"
+
+# ---------------------------------------------------------------------------
+# Max heart rate -- the anchor for every zone
+# ---------------------------------------------------------------------------
+# Three ways to set this, in descending order of trust:
+#
+#   1. A number you measured. A chest strap at a real maximal effort.
+#   2. "strap" -- derive it from the highest chest-strap reading sustained for
+#      10 s inside a workout. Only useful if you actually wear a strap hard.
+#   3. The highest value your watch has ever recorded on a hard session. This
+#      is a FLOOR, not a measurement: if your true max is five beats higher,
+#      every percentage in the report is roughly two points too high. Say so in
+#      your own notes rather than forgetting it.
+#
+# Two anchors that look reasonable and are not: `220 - age` is a population
+# average with a standard deviation of about 10 bpm, and the 99th percentile of
+# your recorded heart rate is a statement about how often you go hard, not about
+# your ceiling.
+#
+# Optical wrist sensors also double-count: a reading far above everything around
+# it, on a session with no strap, is usually R-wave doubling rather than a
+# record. Check the raw samples before believing a new maximum.
+max_hr = 190.0
+# max_hr = "strap"
+
+# ---------------------------------------------------------------------------
+# What Apple's labels mean on YOUR watch
+# ---------------------------------------------------------------------------
+# Open your own data before filling these in:
+#
+#   python3 hq.py --profile <you> \
+#     "SELECT activity, count(*) n, round(median(duration_min)) med_min,
+#             min(local_date) first, max(local_date) last
+#      FROM workouts GROUP BY 1 ORDER BY n DESC"
+#
+# A label with a stable weekday, a stable duration and a start date that matches
+# when you joined a gym is a class, whatever Apple calls it.
+
+# Resistance work. Excluded from the aerobic intensity distribution: heart rate
+# while lifting reflects local muscular demand and rest intervals, not aerobic
+# stimulus, so mixing it in makes the easy/hard split meaningless.
+strength = [
+    "FunctionalStrengthTraining",
+    "TraditionalStrengthTraining",
+    "CoreTraining",
+]
+
+# Mixed circuit work -- cardio, core and dumbbells in one session. Neither
+# aerobic base nor progressive strength, so it is reported on its own instead of
+# being forced into either bucket.
+hybrid = ["HighIntensityIntervalTraining"]
+
+# Apps that write their own record for a session your watch already logged.
+# Counting both double-counts the time. Find them with:
+#
+#   python3 hq.py --profile <you> \
+#     "SELECT source_name, count(*) FROM workouts GROUP BY 1 ORDER BY 2 DESC"
+#
+# A source whose sessions overlap watch sessions in time, carry no heart rate
+# and disagree on calories is a duplicate log, not a second workout.
+duplicates = []
+
+# Days when your watch was reading somebody else's chest strap. Two people who
+# train together and share a strap will do this: it pairs to whichever watch
+# asks first, and the export labels the samples with the device, never with
+# whose chest they came from.
+#
+# The test is exact. Pull the raw heart-rate stream for the day out of both
+# exports and intersect on (timestamp, bpm). Two independent sensors on two
+# people never agree beat for beat; one strap agrees on nearly every shared
+# second. Volume and pace from such a session are still yours -- only the heart
+# rate is dropped.
+cross_talk = []
+
+# How a chest strap identifies itself in the raw stream. The export uses the
+# phone's locale, so a German phone writes "Bluetooth-Gerät" for the device an
+# English one calls "Bluetooth Device". Add yours if it appears under a third
+# name; check with:
+#
+#   python3 hq.py --profile <you> \
+#     "SELECT source_name, device_name, count(*) FROM hr GROUP BY 1,2 ORDER BY 3 DESC"
+strap_sources = ["Bluetooth Device", "Bluetooth-Gerät"]
+
+# ---------------------------------------------------------------------------
+# Optional: the phone-backup route (the health-sync skill)
+# ---------------------------------------------------------------------------
+# Leave these out entirely if you only use the XML-export route.
+#
+# device_udid is the safety catch. With two phones in one household the sync
+# script would otherwise back up whichever was plugged in and write it over
+# whichever database it was pointed at. Find yours with:
+#
+#   pymobiledevice3 usbmux list
+#
+# backup_root = "~/HealthBackups"
+# device_udid = "00000000-0000000000000000"
+#
+# Where the backup password lives. The default is the login keychain under the
+# service name below; op_ref additionally reads a 1Password item if you use one.
+# keychain_service = "ios-backup"
+# op_ref = "op://<vault>/<item>/password"
+# op_account = "my.1password.com"   # only if you have several accounts
+
+# ---------------------------------------------------------------------------
+# Optional: zone bands, as fractions of max_hr
+# ---------------------------------------------------------------------------
+# The default is the conventional five-zone split below. Changing it makes your
+# reports incomparable with anyone else's, which is fine as long as it is
+# deliberate. The bands must touch: a gap means time in it is counted nowhere.
+#
+# [[zones]]
+# name = "Z1 recovery"
+# lo = 0.00
+# hi = 0.60

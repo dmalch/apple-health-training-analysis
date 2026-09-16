@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Named `test` because the branch ruleset requires that exact check name.
+  # Renaming this job silently stops blocking merges.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor: profiles are TOML and tomllib arrived in 3.11.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      # The fixtures are synthetic; no health data is involved.
+      - run: python -m unittest discover -p 'test_*.py' -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      # The sync extras are installed so pyright can resolve the optional
+      # backup-route imports instead of reporting them as missing.
+      - run: pip install -r requirements.txt -r requirements-sync.txt -r requirements-dev.txt
+      - run: ruff check --output-format=github .
+      - run: ruff format --check .
+      - run: pyright
