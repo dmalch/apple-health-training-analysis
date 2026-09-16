@@ -4,6 +4,12 @@
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# ruff 0.16 began formatting Python inside Markdown code blocks. The snippets in
+# docs/ are deliberately partial -- `password=...`, `<workouts.data_id>` -- so the
+# formatter would either rewrite them into something misleading or fail to parse
+# them. Excluding Markdown also keeps the check reproducible across ruff versions,
+# which a Dependabot bump otherwise broke.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [

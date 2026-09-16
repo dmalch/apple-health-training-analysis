@@ -36,9 +36,13 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      # The sync extras are installed so pyright can resolve the optional
-      # backup-route imports instead of reporting them as missing.
-      - run: pip install -r requirements.txt -r requirements-sync.txt -r requirements-dev.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # pyiosbackup alone, not all of requirements-sync.txt: it is the only one of
+      # the backup-route extras that is imported from Python, so it is all pyright
+      # needs. pymobiledevice3 is invoked as a CLI from sync_health.sh and would
+      # drag in eighty packages for nothing.
+      - run: pip install "$(grep '^pyiosbackup==' requirements-sync.txt)"
+      - run: ruff --version && pyright --version
       - run: ruff check --output-format=github .
       - run: ruff format --check .
       - run: pyright
