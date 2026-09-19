@@ -90,6 +90,22 @@ fixing before the second phone ever appears.
   trust this computer`, which fails *instantly*, with no `waiting user pairing
   dialog...` line — clear it with Settings → General → Transfer or Reset iPhone →
   Reset → Reset Location & Privacy).
+- **iOS asks for the device passcode ON THE PHONE before an encrypted backup, and
+  `pymobiledevice3` does not survive the prompt.** Seen on iOS 27, 19 Sep 2026. The run
+  dies in the first seconds with nothing but `ERROR Connection was terminated abruptly`
+  and exit 1 — the same signature as a dropped USB bus, which sends you diagnosing the
+  wrong thing. The tell is one line earlier in a verbose run:
+  `WARNING Please enter the device passcode to continue the backup`, followed ~7-15 s
+  later by `INFO Device passcode prompt dismissed`. Everything else checks out while this
+  happens: `usbmux list` shows the device, `lockdown info` answers, `backup2 encryption`
+  returns `on`. **Distinguish it from the bus failure by whether `usbmux list` is empty** —
+  bus failure empties it, this does not. The prompt window is short and unlogged on the
+  Mac side, so catching it by hand takes luck.
+  **The reliable workaround is to let Finder take the backup** — it presents the passcode
+  prompt natively and waits — and then convert it:
+  `sync_health.sh --profile NAME --skip-backup`. `resolve_backup` falls through to the
+  MobileSync directory on its own, and because `newest_backup` requires a `Manifest.db`,
+  a half-finished Finder attempt is skipped rather than converted.
 - **An aborted transfer costs you the incremental path.** The phone, not the
   script, decides: after a crashed attempt the next `Status.plist` comes back
   `IsFullBackup: true` even though the local side asked for incremental. There is
@@ -121,6 +137,24 @@ fixing before the second phone ever appears.
   `healthdb.sqlite` has the device *names* — without it every source reads as a
   bare product code and the strap-vs-watch split that anchors the HR zones is
   lost.
+
+- **Wi-Fi is possible but is not a shortcut.** `pymobiledevice3 --mobdev2` discovers the
+  phone over bonjour (`bonjour mobdev2` lists it), and lockdown answers over TCP. Two
+  catches make it worse than the cable in practice: `--udid` cannot select among the
+  results, because bonjour reports `UniqueDeviceID: None` until pair verification, so the
+  CLI falls back to an interactive chooser that a non-tty run cannot answer; and the
+  pairing record is not reachable over TCP (`~/.pymobiledevice3` is usually empty and
+  `/var/db/lockdown` needs root), so `autopair` tries to pair afresh and returns
+  `GetProhibited` against a locked phone. Add that a network transfer is a *full* one at
+  Wi-Fi speed with no resume, and the cable wins every time.
+
+- **A PyPI wheel's `.so` can be killed by Gatekeeper, and the dialog offers to delete it.**
+  On macOS 26/27 an ad-hoc-signed extension module fails to load with
+  `library load disallowed by system policy` and the user is shown a "Not Opened" dialog
+  whose primary button is **Move to Bin** — one click and the library is gone from the
+  venv (it lands in `~/.Trash` and can be moved straight back). Tell them to press *Done*.
+  The fix is `xattr -dr com.apple.quarantine <venv>`, which clears it for every other
+  wheel in that venv too.
 
 ## Reading a session
 
