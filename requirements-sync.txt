@@ -4,6 +4,6 @@
 # pymobiledevice3 is invoked as a CLI by sync_health.sh, never imported.
 # pyiosbackup reads an encrypted backup locally; iOSbackup is the fallback
 # healthdb_to_duckdb.py imports when handed a raw backup folder.
-pymobiledevice3==11.12.5
+pymobiledevice3==11.15.5
 pyiosbackup==0.2.4
 iOSbackup==0.9.925
