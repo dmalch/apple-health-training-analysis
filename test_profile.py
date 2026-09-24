@@ -19,6 +19,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import date
 from pathlib import Path
 
 import athlete_profile
@@ -278,3 +279,107 @@ class ZoneValidationTest(unittest.TestCase):
         """
         with self.assertRaises(athlete_profile.ProfileError):
             self.load(body)
+
+
+class ShoeValidationTest(unittest.TestCase):
+    """A shoe entry that is silently misread reports the wrong mileage without an error."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="shoes-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def load(self, shoes_toml):
+        path = self.dir / "s.toml"
+        path.write_text(textwrap.dedent(MINIMAL + shoes_toml))
+        return athlete_profile.load(path=path)
+
+    def test_no_shoes_is_an_empty_list(self):
+        self.assertEqual(self.load("")["shoes"], [])
+
+    def test_a_shoe_with_only_name_and_since_gets_the_defaults(self):
+        p = self.load(
+            """
+            [[shoes]]
+            name = "Trainer"
+            since = 2025-03-01
+            """
+        )
+        (shoe,) = p["shoes"]
+        self.assertEqual(shoe["name"], "Trainer")
+        self.assertEqual(shoe["since"], date(2025, 3, 1))
+        self.assertIsNone(shoe["retired"])
+        self.assertIsNone(shoe["limit_km"])
+        self.assertEqual(shoe["start_km"], 0.0)
+        self.assertEqual(shoe["activities"], ["Running"])
+
+    def test_a_date_may_also_be_written_as_a_string(self):
+        p = self.load(
+            """
+            [[shoes]]
+            name = "Trainer"
+            since = "2025-03-01"
+            retired = "2025-09-30"
+            """
+        )
+        self.assertEqual(p["shoes"][0]["retired"], date(2025, 9, 30))
+
+    def test_a_typo_in_a_shoe_field_is_refused_not_ignored(self):
+        # `limit` instead of `limit_km`: the limit would simply never be applied.
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(
+                """
+                [[shoes]]
+                name = "Trainer"
+                since = 2025-03-01
+                limit = 600
+                """
+            )
+        self.assertIn("limit", str(e.exception))
+
+    def test_a_since_that_is_not_a_date_is_refused(self):
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(
+                """
+                [[shoes]]
+                name = "Trainer"
+                since = "early May"
+                """
+            )
+        self.assertIn("Trainer", str(e.exception))
+
+    def test_a_shoe_retired_before_it_started_is_refused(self):
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(
+                """
+                [[shoes]]
+                name = "Trainer"
+                since = 2025-03-01
+                retired = 2025-02-01
+                """
+            )
+        self.assertIn("retired", str(e.exception))
+
+    def test_a_non_positive_limit_is_refused(self):
+        with self.assertRaises(athlete_profile.ProfileError):
+            self.load(
+                """
+                [[shoes]]
+                name = "Trainer"
+                since = 2025-03-01
+                limit_km = 0
+                """
+            )
+
+    def test_two_shoes_with_one_name_are_refused(self):
+        with self.assertRaises(athlete_profile.ProfileError) as e:
+            self.load(
+                """
+                [[shoes]]
+                name = "Trainer"
+                since = 2025-03-01
+                [[shoes]]
+                name = "Trainer"
+                since = 2025-06-01
+                """
+            )
+        self.assertIn("Trainer", str(e.exception))

@@ -142,3 +142,20 @@ strap_sources = ["Bluetooth Device", "Bluetooth-Gerät"]
 # name = "Z1 recovery"
 # lo = 0.00
 # hi = 0.60
+
+# ---------------------------------------------------------------------------
+# Optional: shoes, for shoes.py
+# ---------------------------------------------------------------------------
+# Apple Health records no gear, so a pair is described by the days it was in
+# use and what it is worn for. Its mileage is every workout of those activities
+# from `since` to `retired`, both days included. Give pairs worn on the same days
+# for the same activity only if you accept that each such workout is counted
+# for both -- the report warns when that happens.
+#
+# [[shoes]]
+# name = "Road trainer"
+# since = 2026-05-01          # first day in use
+# retired = 2026-12-31        # last day; leave out while in use
+# limit_km = 600              # optional: report the share of it used
+# start_km = 0                # km already on the pair when tracking began
+# activities = ["Running"]    # the default; e.g. ["Hiking"] for boots

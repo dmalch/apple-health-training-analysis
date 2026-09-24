@@ -30,6 +30,7 @@ As a shell helper, one field can be printed on stdout:
 
 import os
 import tomllib
+from datetime import date, datetime
 from pathlib import Path
 
 # Percentage-of-max bands. Overridable per profile, but the defaults are the
@@ -62,6 +63,7 @@ KNOWN = {
     "cross_talk",
     "strap_sources",
     "zones",
+    "shoes",
     "backup_root",
     "device_udid",
     "keychain_service",
@@ -164,6 +166,7 @@ def load(name=None, path=None):
             )
 
     prof["zones"] = parse_zones(prof.get("zones"), src)
+    prof["shoes"] = parse_shoes(prof.get("shoes"), src)
     prof["path"] = str(src)
     return prof
 
@@ -214,6 +217,98 @@ def parse_zones(zones, src):
             "below that would be counted in no zone at all."
         )
 
+    return out
+
+
+SHOE_FIELDS = {"name", "since", "retired", "limit_km", "start_km", "activities"}
+
+
+def _shoe_date(value, what, src):
+    """A TOML date, or the same written as an ISO string."""
+    if isinstance(value, datetime):
+        raise ProfileError(f"{src}: {what} must be a date, not a date-time ({value})")
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise ProfileError(f"{src}: {what} must be a date such as 2026-05-01, got {value!r}")
+
+
+def parse_shoes(shoes, src):
+    """Validate the shoe list, one entry per pair, in use from `since` to `retired`.
+
+    Apple Health records no gear, so a pair's mileage is every run inside its date
+    range. A misread entry would not fail: a typo'd `limit` would never warn, and a
+    date read as text would count nothing. So every field is checked here.
+    """
+    if shoes is None:
+        return []
+    if not isinstance(shoes, list):
+        raise ProfileError(f"{src}: shoes must be an array of tables ([[shoes]])")
+
+    out = []
+    for i, s in enumerate(shoes):
+        if not isinstance(s, dict):
+            raise ProfileError(f"{src}: shoes[{i}] must be a table")
+        name = s.get("name")
+        if not isinstance(name, str) or not name:
+            raise ProfileError(f"{src}: shoes[{i}] needs a name")
+        unknown = sorted(set(s) - SHOE_FIELDS)
+        if unknown:
+            raise ProfileError(
+                f"{src}: shoe {name!r} has unknown field(s) {', '.join(unknown)}. "
+                f"Known fields: {', '.join(sorted(SHOE_FIELDS))}"
+            )
+        if "since" not in s:
+            raise ProfileError(f"{src}: shoe {name!r} needs since, the first day in use")
+        since = _shoe_date(s["since"], f"shoe {name!r} since", src)
+        retired = s.get("retired")
+        if retired is not None:
+            retired = _shoe_date(retired, f"shoe {name!r} retired", src)
+            if retired < since:
+                raise ProfileError(
+                    f"{src}: shoe {name!r} is retired on {retired}, before it was "
+                    f"first used on {since}"
+                )
+
+        limit_km = s.get("limit_km")
+        if limit_km is not None:
+            if isinstance(limit_km, bool) or not isinstance(limit_km, (int, float)):
+                raise ProfileError(f"{src}: shoe {name!r} limit_km must be a number")
+            if limit_km <= 0:
+                raise ProfileError(f"{src}: shoe {name!r} limit_km must be above 0")
+            limit_km = float(limit_km)
+
+        start_km = s.get("start_km", 0.0)
+        if isinstance(start_km, bool) or not isinstance(start_km, (int, float)) or start_km < 0:
+            raise ProfileError(f"{src}: shoe {name!r} start_km must be a number, 0 or more")
+
+        activities = s.get("activities", ["Running"])
+        if (
+            not isinstance(activities, list)
+            or not activities
+            or any(not isinstance(a, str) for a in activities)
+        ):
+            raise ProfileError(
+                f"{src}: shoe {name!r} activities must be a non-empty list of strings"
+            )
+
+        if any(o["name"] == name for o in out):
+            raise ProfileError(f"{src}: two shoes are called {name!r}; names must differ")
+
+        out.append(
+            {
+                "name": name,
+                "since": since,
+                "retired": retired,
+                "limit_km": limit_km,
+                "start_km": float(start_km),
+                "activities": list(activities),
+            }
+        )
     return out
 
 

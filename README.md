@@ -102,6 +102,7 @@ Only that template is tracked by git; your own profile is ignored.
 | `hq.py` | read-only SQL over the database |
 | `analyze.py` | the Markdown training-load report |
 | `analyze_intervals.py` | one interval session, rep by rep |
+| `shoes.py` | mileage per pair of shoes, from date ranges in the profile |
 | `athlete_profile.py` | loads and validates a profile |
 
 ## Documentation
