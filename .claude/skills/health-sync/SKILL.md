@@ -90,6 +90,20 @@ fixing before the second phone ever appears.
   trust this computer`, which fails *instantly*, with no `waiting user pairing
   dialog...` line — clear it with Settings → General → Transfer or Reset iPhone →
   Reset → Reset Location & Privacy).
+- **Judge a flaky cable from the kernel log, not from usbmuxd.** usbmuxd logs
+  `deviceRequiresMuxConfiguration` on every enumeration, and a person moving the cable
+  between ports produces exactly the same burst as a bad cable — counting those lines
+  "proved" a flapping connection on 24 Sep 2026 that was really someone re-plugging.
+  The kernel tells them apart:
+  ```bash
+  /usr/bin/log show --last 15m --style compact \
+    --predicate 'process == "kernel" AND eventMessage CONTAINS "AppleUSBHostPort"'
+  ```
+  `cableChangeOccurred: powering off` on one port followed by `powering on` on another
+  is a hand; `terminateDevice: ... hardware connection lost` with no `cableChangeOccurred`
+  around it is a real drop. One `hardware connection lost` within a second of the first
+  enumeration is ordinary contact bounce at plug-in. (Call `/usr/bin/log` by full path:
+  in zsh, `log` is a builtin and fails with `too many arguments`.)
 - **iOS asks for the device passcode ON THE PHONE before an encrypted backup, and
   `pymobiledevice3` does not survive the prompt.** Seen on iOS 27, 19 Sep 2026. The run
   dies in the first seconds with nothing but `ERROR Connection was terminated abruptly`
@@ -98,14 +112,39 @@ fixing before the second phone ever appears.
   `WARNING Please enter the device passcode to continue the backup`, followed ~7-15 s
   later by `INFO Device passcode prompt dismissed`. Everything else checks out while this
   happens: `usbmux list` shows the device, `lockdown info` answers, `backup2 encryption`
-  returns `on`. **Distinguish it from the bus failure by whether `usbmux list` is empty** —
-  bus failure empties it, this does not. The prompt window is short and unlogged on the
-  Mac side, so catching it by hand takes luck.
+  returns `on`. **Distinguish it from the bus failure by whether `usbmux list` still has a
+  `"ConnectionType": "USB"` entry** — bus failure removes it, this does not. Do not test
+  for an empty list: on 24 Sep 2026 the list also carried a `Network` entry for the same
+  phone while it was cabled, so it was never empty. The prompt window is short and
+  unlogged on the Mac side, so catching it by hand takes luck.
+  It recurred on 24 Sep 2026, so treat it as the normal case on iOS 27, not a one-off.
   **The reliable workaround is to let Finder take the backup** — it presents the passcode
   prompt natively and waits — and then convert it:
   `sync_health.sh --profile NAME --skip-backup`. `resolve_backup` falls through to the
   MobileSync directory on its own, and because `newest_backup` requires a `Manifest.db`,
   a half-finished Finder attempt is skipped rather than converted.
+- **Finder can hang on "Loading…" over USB too — its device agents wedge, not the
+  phone.** Seen 24 Sep 2026: the phone was in the sidebar, cabled and trusted
+  (`lockdown info` answered, `TrustedHostAttached: true`), and its content never
+  opened. The phone had bounced on the bus a few times while being plugged in, and
+  `AMPDevicesAgent` logged a burst of `Assertion failure: err == (-42059)` at that
+  moment, with `AMPDeviceDiscoveryAgent` failing lockdown on the stale device IDs
+  (`kAMDDeviceDisconnectedError`). The sequence that fixed it — which step was the
+  decisive one is not known, and each alone looked like it had failed:
+  ```bash
+  killall AMPDeviceDiscoveryAgent AMPDevicesAgent   # launchd respawns discovery itself
+  launchctl kickstart gui/$(id -u)/com.apple.AMPDevicesAgent   # this one does NOT come back alone
+  killall Finder   # it holds the dead agent's connection and drops the phone from the sidebar
+  ```
+  `launchctl kickstart -k` on the discovery agent is refused under SIP; `killall` works.
+  Finder has the phone again when its log shows `deviceAttached <udid>`
+  (subsystem `com.apple.DesktopServices`, category `iTunes`).
+- **Finder's backup is a CLI underneath.** Finder does not back up in-process: it spawns
+  `/System/Library/PrivateFrameworks/MobileDevice.framework/Versions/Current/AppleMobileDeviceHelper.app/Contents/Resources/AppleMobileBackup --pipe 9 30`,
+  and the same binary documents `--backup --target <udid>` in its `--help`. It could
+  replace the Finder click, **but that is untested** (24 Sep 2026) — in particular
+  whether it waits for the on-phone passcode prompt the way Finder does. The same binary
+  also has `--restore` and `--erase`; never run either.
 - **An aborted transfer costs you the incremental path.** The phone, not the
   script, decides: after a crashed attempt the next `Status.plist` comes back
   `IsFullBackup: true` even though the local side asked for incremental. There is
@@ -138,15 +177,28 @@ fixing before the second phone ever appears.
   bare product code and the strap-vs-watch split that anchors the HR zones is
   lost.
 
-- **Wi-Fi is possible but is not a shortcut.** `pymobiledevice3 --mobdev2` discovers the
-  phone over bonjour (`bonjour mobdev2` lists it), and lockdown answers over TCP. Two
-  catches make it worse than the cable in practice: `--udid` cannot select among the
-  results, because bonjour reports `UniqueDeviceID: None` until pair verification, so the
-  CLI falls back to an interactive chooser that a non-tty run cannot answer; and the
-  pairing record is not reachable over TCP (`~/.pymobiledevice3` is usually empty and
-  `/var/db/lockdown` needs root), so `autopair` tries to pair afresh and returns
-  `GetProhibited` against a locked phone. Add that a network transfer is a *full* one at
-  Wi-Fi speed with no resume, and the cable wins every time.
+- **Wi-Fi does not work on iOS 27 + macOS 27 — use the cable.** Tested 22 Sep 2026, every
+  route:
+  - *Pairing is not the blocker.* usbmuxd hands the system pair record to any local
+    client (`ReadPairRecord`, no root), and `create_using_tcp(host, identifier=udid,
+    autopair=False, pair_record=...)` built from it comes back `paired: True`. (An
+    earlier note here said the record was unreachable over TCP; that was wrong.)
+  - *Services are.* Over that TCP lockdown only `get_value` works. Every started
+    service — `mobilebackup2`, AFC, diagnostics — is closed by the phone at its first
+    read (`ConnectionTerminatedError`, 0 bytes), with the phone unlocked and
+    `EnableWifiConnections: True`. The phone also advertises `_remotepairing._tcp`,
+    so iOS 27 appears to serve network sessions only over RemotePairing/RSD.
+  - *Finder does not help either.* On 22 Sep macOS 27's usbmuxd did not list the phone
+    as a network device (`usbmux list` stayed `[]`), so Finder showed it in the sidebar
+    from bonjour and hung on "Loading…"; `AMPDevicesAgent` logs `client connection timed
+    out waiting for device <udid>`. Toggling the phone's Wi-Fi changes nothing. On
+    24 Sep, with the cable in, usbmuxd did list a `Network` entry beside the USB one —
+    and connections through it still died at once (`MuxTCPSendNextSegmentOverNetwork
+    Unexpected EOF` in the usbmuxd log). A listed network entry is not a usable one.
+  - `pymobiledevice3 --mobdev2` also cannot pick a device non-interactively: bonjour
+    reports `UniqueDeviceID: None` until pair verification.
+  Plug in, let Finder take the backup, then `--skip-backup`. Over USB a Finder
+  incremental took minutes.
 
 - **A PyPI wheel's `.so` can be killed by Gatekeeper, and the dialog offers to delete it.**
   On macOS 26/27 an ad-hoc-signed extension module fails to load with
