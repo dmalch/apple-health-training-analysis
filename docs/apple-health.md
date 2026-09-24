@@ -150,7 +150,17 @@ watch.
 
 `workout_events` type 7 (`Segment`) is **Apple's automatic segmentation** —
 overlapping spans that cover the session end to end and mean nothing.
-`analyze_intervals.py` is right to discard them. The real structure is in
+`analyze_intervals.py` is right to discard them.
+
+Type 4 (`Marker`, zero duration) is the opposite, and it is the only human-made structure
+in an unstructured session: **manual segment presses land here, not under `Segment`.**
+On a 77-minute interval class with eight presses, the markers split warm-up, six
+interval blocks and the closing core work exactly, and three consecutive blocks of
+8.4 / 7.8 / 8.1 min were enough to settle the work/rest scheme (16 × 30 s, i.e. 20/10)
+that the athlete remembered as 40–45 s on / 15–20 s off. People skip presses mid-session,
+so read a long gap as possibly two blocks rather than one.
+
+For a structured workout the real structure is in
 `workout_activities`, keyed by `owner_id` → `workouts.data_id`, one row per block
 plus one `is_primary_activity = 1` row spanning the whole session:
 
