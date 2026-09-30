@@ -185,12 +185,34 @@ how to tell the two apart. The converter exposes all of it as `workout_blocks`, 
 `seq` counts the primary and the non-primary rows separately — both start at 1, so
 order by it only with `NOT is_primary` in the filter.
 
-**No row says which kind of step it is.** A warm-up, a work step, a recovery and a
-cool-down look alike. The workout's `_HKPrivateWorkoutConfiguration` metadata key is
-the one place the plan might be spelled out, but its value is a binary payload
-(value_type 4) that the converter drops as NULL; nobody has decoded it yet. So the
-kind is inferred, and heart rate is the wrong thing to infer it from on short blocks:
-it trails effort by 30–60 s. On one-minute strides with two-minute recoveries the
+**The kind of each step is recorded, in two places the converter drops.** Neither
+`workout_blocks` column says whether a row was a warm-up, a work step, a recovery or a
+cool-down, but the backup does:
+
+- **The plan** is the workout's `_HKPrivateWorkoutConfiguration` metadata, a
+  value_type 4 payload in `metadata_values.data_value` that the converter stores as
+  NULL. It is JSON, not a binary plist: `{"proto_data": <base64 protobuf>, "data":
+  <base64 JSON>, ...}`, and `data` alone carries everything, readable without the
+  protobuf. It decodes to `{"intervalWorkout": {"name", "warmupBlock", "stepBlocks",
+  "cooldownBlock"}}`. Each block is `{"steps": [...], "count": <repetitions>}`, and each
+  step has a `stepType` (**0 work, 1 recovery, 2 warm-up, 3 cool-down**), a `goal` (a
+  base64 NSKeyedArchiver plist whose `NLSessionActivityGoalValue` is in the unit its
+  `HKQuantity` names, e.g. 900 s; 0 is an open goal) and `targetZoneDatas` (base64
+  JSON, e.g. `{"type": "instantaneous_pace", "min": 2.70, "max": 2.70}` in m/s).
+- **Which step each block ran** is in `workout_activities.metadata`, one NSKeyedArchiver
+  plist per row, under `WOIntervalStepKeyPath`: `"block.iteration.step"`. Blocks are
+  numbered warm-up, step blocks, cool-down, **counting only blocks that have steps**: a
+  plan with an empty warm-up starts at block 0 on its first step block, and indexing
+  the full list instead runs off the end. `WOIntervalStepSuccessful` sits beside it
+  but is only set on recent sessions (false or absent on every older one checked), so
+  it cannot say which steps were cut short.
+
+Following the key path into the plan labelled all 12 structured sessions checked,
+including a rowing session with no heart rate inside its blocks at all.
+
+Where that is not available — an XML-built database, a converter that has not been
+taught to read it — the kind has to be inferred, and heart rate is the wrong thing to
+infer it from on short blocks: it trails effort by 30–60 s. On one-minute strides with two-minute recoveries the
 strides averaged within 4 bpm of the recoveries, and below them twice in four. On
 40 s / 20 s sets, calling a block work when it ran hotter than both neighbours labelled
 every 20-second recovery as the rep. Pace has no lag and split both sessions cleanly,
@@ -208,8 +230,12 @@ before it and still nothing like the reps. A threshold on the session mean break
 heart rate drifts up as a session goes, so the last recoveries end up above the mean
 while the warm-up sits below it.
 
-The labels describe what was run, not what was planned. A set rest run at rep pace is
-labelled work, because it was.
+The labels describe what was run, not what was planned. Against the decoded plans, the
+inference matched 8 of 11 GPS sessions exactly, and every difference is one of those:
+a set rest run at rep pace (inferred as work), an open-goal walk-back ending the session
+(planned as a recovery, inferred as a cool-down), and the easy first step of an
+"11 + 3" run (planned as work, inferred as a warm-up). The plan says what was meant;
+effort says what happened. A report may want either, but it must say which.
 
 Reading real boundaries changes numbers. One session's reps turned out to be exactly
 4:00 each rather than the 3:50–3:58 the speed detector inferred. **Anything compared
