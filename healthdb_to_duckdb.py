@@ -31,7 +31,10 @@ sources still overlap.
 """
 
 import argparse
+import base64
+import json
 import os
+import plistlib
 import shutil
 import sqlite3
 import sys
@@ -741,7 +744,7 @@ def build(db_path, out_db, tz_default):
     print(f"  records              {n:>12,} rows  ({time.time() - t0:.1f}s)", file=sys.stderr)
 
     build_workouts(con, cols, tz_default, dev_expr, dev_lookup, src_expr, src_lookup)
-    build_blocks(con, cols)
+    build_blocks(con, con_sq, cols)
     build_route(con, cols)
     build_metadata(con, con_sq, cols)
     stub_missing(con)
@@ -878,8 +881,150 @@ def build_workouts(con, cols, tz_default, dev_expr, dev_lookup, src_expr, src_lo
 WORKOUT_ROUTE_TYPE = 102  # HKWorkoutRouteTypeIdentifier
 
 
-def build_blocks(con, cols):
-    """The blocks a structured workout was actually built from.
+WORKOUT_BLOCKS_SCHEMA = """
+    workout_id BIGINT, seq BIGINT, is_primary BOOLEAN,
+    start_date TIMESTAMPTZ, end_date TIMESTAMPTZ, duration_min DOUBLE,
+    kind VARCHAR, step_path VARCHAR, goal_value DOUBLE, goal_unit VARCHAR,
+    target_type VARCHAR, target_min DOUBLE, target_max DOUBLE"""
+
+# A custom workout step's `stepType`, from the plan the watch ran.
+STEP_KINDS = {0: "work", 1: "recovery", 2: "warmup", 3: "cooldown"}
+
+# What a malformed payload raises on the way through json, base64, plistlib and
+# the lookups after them (binascii.Error and InvalidFileException are ValueErrors).
+UNREADABLE = (ValueError, KeyError, IndexError, TypeError, AttributeError)
+
+
+def unarchive(blob):
+    """Plain Python values out of an NSKeyedArchiver binary plist.
+
+    Enough of the format for what the watch writes here: NSDictionary as
+    NS.keys / NS.objects, class instances as their own keys, everything else
+    reached through UIDs into `$objects`. Class names are dropped.
+    """
+    archive = plistlib.loads(blob)
+    objects = archive["$objects"]
+
+    def resolve(value, depth=0):
+        if depth > 50:
+            raise ValueError("archive nests deeper than any the watch writes")
+        if isinstance(value, plistlib.UID):
+            return resolve(objects[value.data], depth + 1)
+        if value == "$null":
+            return None
+        if isinstance(value, dict):
+            if "NS.keys" in value:
+                keys = [resolve(k, depth + 1) for k in value["NS.keys"]]
+                vals = [resolve(v, depth + 1) for v in value["NS.objects"]]
+                return dict(zip(keys, vals, strict=True))
+            if "NS.objects" in value:
+                return [resolve(v, depth + 1) for v in value["NS.objects"]]
+            if "NS.string" in value:
+                return value["NS.string"]
+            return {k: resolve(v, depth + 1) for k, v in value.items() if k != "$class"}
+        return value
+
+    return resolve(archive["$top"]["root"])
+
+
+def decode_step(step):
+    """One plan step as the columns workout_blocks carries."""
+    goal = unarchive(base64.b64decode(step["goal"])) if step.get("goal") else {}
+    if not isinstance(goal, dict):
+        raise ValueError("a step goal that is not an archived object")
+    unit = (goal.get("NLSessionActivityGoalQuantity") or {}).get("UnitKey") or {}
+    zones = step.get("targetZoneDatas") or []
+    # The first target is the one the watch shows.
+    target = json.loads(base64.b64decode(zones[0])) if zones else {}
+    return {
+        "kind": STEP_KINDS.get(step.get("stepType")),
+        "goal_value": goal.get("NLSessionActivityGoalValue"),
+        "goal_unit": unit.get("HKUnitStringKey"),
+        "target_type": target.get("type"),
+        "target_min": target.get("min"),
+        "target_max": target.get("max"),
+    }
+
+
+def decode_plan(config):
+    """The steps of a custom workout, from its `_HKPrivateWorkoutConfiguration`.
+
+    The payload is JSON; its base64 `data` field is the plan, readable without
+    the protobuf in `proto_data`. Returns one list of decoded steps per block --
+    warm-up, step blocks, cool-down -- keeping only blocks that have steps,
+    because that is how the watch numbers them. None for anything that is not a
+    readable interval plan: most workouts carry a configuration holding only an
+    open, time or distance goal.
+    """
+    try:
+        payload = json.loads(config)
+        plan = json.loads(base64.b64decode(payload["data"], validate=True))
+        workout = plan.get("intervalWorkout")
+        if not workout:
+            return None
+        blocks = [
+            workout.get("warmupBlock"),
+            *(workout.get("stepBlocks") or []),
+            workout.get("cooldownBlock"),
+        ]
+        return [[decode_step(st) for st in b["steps"]] for b in blocks if b and b.get("steps")]
+    except UNREADABLE:
+        return None
+
+
+def step_key_path(metadata):
+    """`WOIntervalStepKeyPath` from a block's metadata plist, or None."""
+    try:
+        root = unarchive(metadata)
+    except UNREADABLE:
+        return None
+    value = root.get("WOIntervalStepKeyPath") if isinstance(root, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def plan_step(plan, key_path):
+    """The step a block ran, from its "block.iteration.step" key path, or None."""
+    try:
+        block, _iteration, step = (int(part) for part in key_path.split("."))
+        return plan[block][step]
+    except UNREADABLE:
+        return None
+
+
+def block_steps(con_sq, cols):
+    """(activity ROWID, kind, key path, goal and target) for every planned block.
+
+    The block rows say nothing about which kind of step they were. The plan is
+    in the workout's metadata, and each block names the step it ran in its own
+    metadata plist, so the two are joined in Python.
+    """
+    needed = {"metadata_values", "metadata_keys"}
+    if "metadata" not in cols.get("workout_activities", []) or not needed <= cols.keys():
+        return []
+    plans = {}
+    for owner, config in con_sq.execute("""
+            SELECT m.object_id, m.data_value FROM metadata_values m
+            JOIN metadata_keys k ON k.ROWID = m.key_id
+            WHERE k.key = '_HKPrivateWorkoutConfiguration' AND m.data_value IS NOT NULL"""):
+        plan = decode_plan(config)
+        if plan:
+            plans[owner] = plan
+    out = []
+    for rowid, owner, metadata in con_sq.execute("""
+            SELECT ROWID, owner_id, metadata FROM workout_activities
+            WHERE is_primary_activity = 0 AND metadata IS NOT NULL"""):
+        if owner not in plans:
+            continue
+        path = step_key_path(metadata)
+        step = plan_step(plans[owner], path)
+        if step and step["kind"]:
+            fields = ("goal_value", "goal_unit", "target_type", "target_min", "target_max")
+            out.append((rowid, step["kind"], path, *(step[f] for f in fields)))
+    return out
+
+
+def build_blocks(con, con_sq, cols):
+    """The blocks a structured workout was actually built from, and what each was.
 
     Not to be confused with `workout_events` type 7 (`Segment`), which is
     Apple's automatic segmentation: overlapping spans that tile the session end
@@ -888,27 +1033,44 @@ def build_blocks(con, cols):
     `is_primary_activity` marking the rows that describe the session as a whole.
     An ordinary unstructured workout has only those primary rows, which is how
     the two are told apart.
+
+    `kind` and the planned goal and target come from the workout's plan, via
+    block_steps; they stay NULL wherever there is no plan to read.
     """
     if "workout_activities" not in cols:
-        con.execute("""
-            CREATE TABLE workout_blocks (
-                workout_id BIGINT, seq BIGINT, is_primary BOOLEAN,
-                start_date TIMESTAMPTZ, end_date TIMESTAMPTZ, duration_min DOUBLE)""")
+        con.execute(f"CREATE TABLE workout_blocks ({WORKOUT_BLOCKS_SCHEMA})")
         return
+    # The join needs ROWID as a real column; the sqlite scanner does not expose
+    # an implicit one. Without it every block simply carries no kind.
+    has_rowid = any(c.lower() == "rowid" for c in cols["workout_activities"])
+    steps = block_steps(con_sq, cols) if has_rowid else []
+    con.execute("""
+        CREATE TEMP TABLE block_steps (
+            activity_id BIGINT, kind VARCHAR, step_path VARCHAR, goal_value DOUBLE,
+            goal_unit VARCHAR, target_type VARCHAR, target_min DOUBLE, target_max DOUBLE)""")
+    if steps:
+        con.executemany("INSERT INTO block_steps VALUES (?, ?, ?, ?, ?, ?, ?, ?)", steps)
     con.execute(f"""
         CREATE OR REPLACE TABLE workout_blocks AS
-        SELECT owner_id                                       AS workout_id,
-               row_number() OVER (PARTITION BY owner_id, is_primary_activity
-                                  ORDER BY start_date)        AS seq,
-               is_primary_activity = 1                        AS is_primary,
-               to_timestamp(start_date + {APPLE_EPOCH_OFFSET}) AS start_date,
-               to_timestamp(end_date   + {APPLE_EPOCH_OFFSET}) AS end_date,
-               CAST(duration AS DOUBLE) / 60.0                AS duration_min
-        FROM hk.workout_activities
-        ORDER BY owner_id, start_date
+        SELECT a.owner_id                                        AS workout_id,
+               row_number() OVER (PARTITION BY a.owner_id, a.is_primary_activity
+                                  ORDER BY a.start_date)         AS seq,
+               a.is_primary_activity = 1                         AS is_primary,
+               to_timestamp(a.start_date + {APPLE_EPOCH_OFFSET}) AS start_date,
+               to_timestamp(a.end_date   + {APPLE_EPOCH_OFFSET}) AS end_date,
+               CAST(a.duration AS DOUBLE) / 60.0                 AS duration_min,
+               s.kind, s.step_path, s.goal_value, s.goal_unit,
+               s.target_type, s.target_min, s.target_max
+        FROM hk.workout_activities a
+        LEFT JOIN block_steps s ON {"s.activity_id = a.ROWID" if has_rowid else "false"}
+        ORDER BY a.owner_id, a.start_date
     """)
+    con.execute("DROP TABLE block_steps")
     n = con.execute("SELECT count(*) FROM workout_blocks WHERE NOT is_primary").fetchone()[0]
-    print(f"  workout_blocks       {n:>12,} rows", file=sys.stderr)
+    print(
+        f"  workout_blocks       {n:>12,} rows, {len(steps):,} labelled from a plan",
+        file=sys.stderr,
+    )
 
 
 def build_route(con, cols):
@@ -1107,10 +1269,7 @@ def stub_missing(con):
         CREATE TABLE IF NOT EXISTS route_points (
             route_file VARCHAR, t TIMESTAMPTZ, lat DOUBLE, lon DOUBLE, ele DOUBLE,
             speed_ms DOUBLE, course DOUBLE, hacc DOUBLE, vacc DOUBLE)""")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS workout_blocks (
-            workout_id BIGINT, seq BIGINT, is_primary BOOLEAN,
-            start_date TIMESTAMPTZ, end_date TIMESTAMPTZ, duration_min DOUBLE)""")
+    con.execute(f"CREATE TABLE IF NOT EXISTS workout_blocks ({WORKOUT_BLOCKS_SCHEMA})")
     con.execute("CREATE TABLE IF NOT EXISTS export_meta (key VARCHAR, value VARCHAR)")
     con.execute("INSERT INTO export_meta VALUES ('source', 'healthdb_secure.sqlite')")
 

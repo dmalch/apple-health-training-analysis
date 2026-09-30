@@ -185,20 +185,23 @@ how to tell the two apart. The converter exposes all of it as `workout_blocks`, 
 `seq` counts the primary and the non-primary rows separately — both start at 1, so
 order by it only with `NOT is_primary` in the filter.
 
-**The kind of each step is recorded, in two places the converter drops.** Neither
-`workout_blocks` column says whether a row was a warm-up, a work step, a recovery or a
-cool-down, but the backup does:
+**The kind of each step is recorded, in two places no single row holds.** The block
+rows themselves do not say whether they were a warm-up, a work step, a recovery or a
+cool-down, but the backup does, and the converter joins the two into `workout_blocks`
+as `kind`, `step_path`, `goal_value` / `goal_unit` and `target_type` / `target_min` /
+`target_max`:
 
-- **The plan** is the workout's `_HKPrivateWorkoutConfiguration` metadata, a
-  value_type 4 payload in `metadata_values.data_value` that the converter stores as
-  NULL. It is JSON, not a binary plist: `{"proto_data": <base64 protobuf>, "data":
-  <base64 JSON>, ...}`, and `data` alone carries everything, readable without the
-  protobuf. It decodes to `{"intervalWorkout": {"name", "warmupBlock", "stepBlocks",
-  "cooldownBlock"}}`. Each block is `{"steps": [...], "count": <repetitions>}`, and each
-  step has a `stepType` (**0 work, 1 recovery, 2 warm-up, 3 cool-down**), a `goal` (a
-  base64 NSKeyedArchiver plist whose `NLSessionActivityGoalValue` is in the unit its
-  `HKQuantity` names, e.g. 900 s; 0 is an open goal) and `targetZoneDatas` (base64
-  JSON, e.g. `{"type": "instantaneous_pace", "min": 2.70, "max": 2.70}` in m/s).
+- **The plan** is the workout's `_HKPrivateWorkoutConfiguration` metadata, a value_type
+  4 payload in `metadata_values.data_value` (still NULL in `workout_metadata`; it is
+  decoded into `workout_blocks` instead). It is JSON, not a binary plist:
+  `{"proto_data": <base64 protobuf>, "data": <base64 JSON>, ...}`, and `data` alone
+  carries everything, readable without the protobuf. It decodes to `{"intervalWorkout":
+  {"name", "warmupBlock", "stepBlocks", "cooldownBlock"}}`. Each block is `{"steps":
+  [...], "count": <repetitions>}`, and each step has a `stepType` (**0 work, 1 recovery,
+  2 warm-up, 3 cool-down**), a `goal` (a base64 NSKeyedArchiver plist whose
+  `NLSessionActivityGoalValue` is in the unit its `HKQuantity` names, e.g. 900 s; 0 is
+  an open goal) and `targetZoneDatas` (base64 JSON, e.g. `{"type": "instantaneous_pace",
+  "min": 2.70, "max": 2.70}` in m/s).
 - **Which step each block ran** is in `workout_activities.metadata`, one NSKeyedArchiver
   plist per row, under `WOIntervalStepKeyPath`: `"block.iteration.step"`. Blocks are
   numbered warm-up, step blocks, cool-down, **counting only blocks that have steps**: a
@@ -210,15 +213,16 @@ cool-down, but the backup does:
 Following the key path into the plan labelled all 12 structured sessions checked,
 including a rowing session with no heart rate inside its blocks at all.
 
-Where that is not available — an XML-built database, a converter that has not been
-taught to read it — the kind has to be inferred, and heart rate is the wrong thing to
-infer it from on short blocks: it trails effort by 30–60 s. On one-minute strides with two-minute recoveries the
-strides averaged within 4 bpm of the recoveries, and below them twice in four. On
-40 s / 20 s sets, calling a block work when it ran hotter than both neighbours labelled
-every 20-second recovery as the rep. Pace has no lag and split both sessions cleanly,
-every rep at least 30% faster than its recovery. `analyze_intervals.py` labels by pace
-when the route covers every block, and by heart rate only when it does not; that still
-works on 4-minute reps.
+Where that is not available — an XML-built database, one converted before the plan
+was read, a session with a block the plan does not cover — `analyze_intervals.py` infers
+the kind for the whole session instead, never mixing the two. Heart rate is the wrong
+thing to infer it from on short blocks: it trails effort by 30–60 s. On one-minute
+strides with two-minute recoveries the strides averaged within 4 bpm of the recoveries,
+and below them twice in four. On 40 s / 20 s sets, calling a block work when it ran
+hotter than both neighbours labelled every 20-second recovery as the rep. Pace has no
+lag and split both sessions cleanly, every rep at least 30% faster than its recovery.
+The inference labels by pace when the route covers every block, and by heart rate only
+when it does not; that still works on 4-minute reps.
 
 Two rules that look right fail on real plans. *Work is harder than both neighbours*
 drops a tempo block followed by strides that outrun it. *Work and recovery alternate*

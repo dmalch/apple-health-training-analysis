@@ -29,7 +29,8 @@ import bisect
 import math
 import statistics
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import NamedTuple
 
 import duckdb
 
@@ -55,6 +56,14 @@ def fmt_pace(min_per_km):
     if s == 60:
         m, s = m + 1, 0
     return f"{m}:{s:02d}"
+
+
+def fmt_target(target_pace):
+    """ " (plan 5:00)" for a planned pace, a range when it has one, or ""."""
+    if not target_pace:
+        return ""
+    fast, slow = (fmt_pace(p) for p in target_pace)
+    return f" (plan {fast})" if fast == slow else f" (plan {fast}-{slow})"
 
 
 def fmt_dur(seconds):
@@ -258,6 +267,23 @@ def build_distance(points):
     return cum, speeds
 
 
+class Block(NamedTuple):
+    """One stretch of a session: what kind it was, when, and its planned pace."""
+
+    kind: str  # warmup, work, recovery or cooldown
+    start: datetime
+    end: datetime
+    # (fastest, slowest) in min/km, where the watch's plan set a pace target.
+    target_pace: tuple[float, float] | None = None
+
+
+def target_pace(target_type, low, high):
+    """A pace target in m/s as (fastest, slowest) min/km, or None."""
+    if not target_type or "pace" not in target_type or not low or not high:
+        return None
+    return 1000 / 60 / max(low, high), 1000 / 60 / min(low, high)
+
+
 # A change of effort between two blocks counts only when it is at least this
 # fraction of the session's whole spread, from its easiest block to its hardest.
 EFFORT_STEP = 0.2
@@ -357,37 +383,55 @@ def blocks_from_structure(con, workout_id, hr_by_t, times=(), cum=()):
 
     `workout_blocks` carries the watch's own plan, so the boundaries are exact
     rather than inferred, and a bout that was stopped early keeps its real
-    length instead of the nominal one. Which block was which kind is not
-    recorded, and label_blocks decides it.
+    length instead of the nominal one. Which kind each block was comes from the
+    plan itself when the converter read it, and from label_blocks otherwise --
+    never a mix of the two, so one unlabelled block sends the whole session to
+    inference.
 
-    Returns ([(kind, start, end), ...], "pace" | "heart rate"), or ([], None)
-    when there is no plan or nothing to tell its blocks apart by.
+    Returns ([Block, ...], "the watch's plan" | "pace" | "heart rate"), or
+    ([], None) when there is no plan or nothing to tell its blocks apart by.
     """
-    if not con.execute(
-        "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'workout_blocks'"
-    ).fetchone()[0]:
+    columns = {
+        name
+        for (name,) in con.execute(
+            "SELECT column_name FROM duckdb_columns() WHERE table_name = 'workout_blocks'"
+        ).fetchall()
+    }
+    if not columns:
         return [], None  # an XML-derived database has no such table
+    # A database built before the converter read the plan has none of these.
+    planned = {"kind", "target_type", "target_min", "target_max"} <= columns
+    plan_cols = "kind, target_type, target_min, target_max" if planned else "NULL, NULL, NULL, NULL"
     # `seq` counts the primary and the non-primary rows separately, so both
     # start at 1; ordering is only sound with the primary row filtered out.
     rows = con.execute(
-        "SELECT start_date, end_date FROM workout_blocks"
+        f"SELECT start_date, end_date, {plan_cols} FROM workout_blocks"
         " WHERE workout_id = ? AND NOT is_primary ORDER BY seq",
         [workout_id],
     ).fetchall()
     if len(rows) < 3:
         return [], None
 
-    efforts, signal = block_efforts(rows, hr_by_t, times, cum)
-    kinds = label_blocks(efforts) if efforts else None
-    if not kinds:
-        return [], None
-    return [(kind, a, b) for kind, (a, b) in zip(kinds, rows, strict=True)], signal
+    spans = [(a, b) for a, b, *_ in rows]
+    targets = [target_pace(*plan[1:]) for _a, _b, *plan in rows]
+    kinds = [kind for _a, _b, kind, *_ in rows]
+    signal = "the watch's plan"
+    if not all(kinds):
+        efforts, signal = block_efforts(spans, hr_by_t, times, cum)
+        kinds = label_blocks(efforts) if efforts else None
+        if not kinds:
+            return [], None
+    blocks = [
+        Block(kind, a, b, target)
+        for kind, (a, b), target in zip(kinds, spans, targets, strict=True)
+    ]
+    return blocks, signal
 
 
 def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=None, cum=None):
     """The watch's own structure first, then lap markers, then thresholded speed.
 
-    Returns ([(kind, start, end), ...], how). Only the structure knows about
+    Returns ([Block, ...], how). Only the structure knows about
     warm-up, recovery and cool-down; the other two yield work bouts alone.
 
     The order matters. `workout_blocks` is the plan the session was actually run
@@ -398,7 +442,7 @@ def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=Non
     """
     structured, signal = blocks_from_structure(con, workout_id, hr_by_t or [], times, cum or [])
     if structured:
-        n_work = sum(kind == "work" for kind, _a, _b in structured)
+        n_work = sum(b.kind == "work" for b in structured)
         print(
             f"\nUsing the watch's own workout structure: {len(structured)} blocks, "
             f"{n_work} of them work, told apart by {signal}.",
@@ -449,7 +493,7 @@ def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=Non
         # and say nothing about the workout's structure -- ignore them.
         if session and covered / session < 0.95:
             print(f"\nUsing the watch's own markers: {len(bounds)} blocks.", file=out)
-            return [("work", a, b) for a, b in bounds], "markers"
+            return [Block("work", a, b) for a, b in bounds], "markers"
         print(
             f"\n  markers cover {100 * covered / session:.0f}% of the session end to end "
             f"-> automatic segmentation, not laps. Ignoring them.",
@@ -478,7 +522,7 @@ def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=Non
         longest = sorted(runs, key=lambda r: -(times[r[1]] - times[r[0]]).total_seconds())
         runs = sorted(longest[:expected], key=lambda r: r[0])
         print(f"  keeping the {expected} longest of {len(longest)} candidate bouts", file=out)
-    return [("work", times[a], times[b]) for a, b in runs], "speed"
+    return [Block("work", times[a], times[b]) for a, b in runs], "speed"
 
 
 def window_stats(t0, t1, times, cum, hr_by_t, above=None):
@@ -518,11 +562,11 @@ def report_blocks(blocks, times, cum, hr_by_t, max_hr, out):
     """
     ordered = []
     prev_end = None
-    for kind, a, b in blocks:
-        if prev_end is not None and (a - prev_end).total_seconds() > 20:
-            ordered.append(("recovery", prev_end, a))
-        ordered.append((kind, a, b))
-        prev_end = b
+    for block in blocks:
+        if prev_end is not None and (block.start - prev_end).total_seconds() > 20:
+            ordered.append(Block("recovery", prev_end, block.start))
+        ordered.append(block)
+        prev_end = block.end
 
     def cell(value, spec="", dash="-"):
         return dash if value is None else format(value, spec)
@@ -537,7 +581,7 @@ def report_blocks(blocks, times, cum, hr_by_t, max_hr, out):
 
     rows = []
     n_work = n_rest = 0
-    for kind, a, b in ordered:
+    for kind, a, b, target in ordered:
         st = window_stats(a, b, times, cum, hr_by_t, above=0.90 * max_hr)
         if kind == "work":
             n_work += 1
@@ -560,7 +604,7 @@ def report_blocks(blocks, times, cum, hr_by_t, max_hr, out):
             f"{(fmt_dur(st['secs_above']) if st['secs_above'] is not None else '-'):>6}",
             file=out,
         )
-        rows.append((kind, label, a, b, st))
+        rows.append((kind, label, a, b, st, target))
 
     work = [r for r in rows if r[0] == "work"]
     rest = [r for r in rows if r[0] == "recovery"]
@@ -595,12 +639,13 @@ def report_blocks(blocks, times, cum, hr_by_t, max_hr, out):
                 f"(total {fmt_dur(sum(above))} of {fmt_dur(sum(durs))})",
                 file=out,
             )
-        paces = [r[4]["pace"] for r in work if r[4]["pace"]]
-        if paces:
-            print(f"  pace per rep: {', '.join(fmt_pace(p) + '/km' for p in paces)}", file=out)
+        paced = [(r[4]["pace"], r[5]) for r in work if r[4]["pace"]]
+        if paced:
+            per_rep = ", ".join(f"{fmt_pace(p)}/km{fmt_target(t)}" for p, t in paced)
+            print(f"  pace per rep: {per_rep}", file=out)
     if rest:
         print("\n## Recoveries", file=out)
-        for _, label, _a, _b, st in rest:
+        for _, label, _a, _b, st, _target in rest:
             drop = None
             if st["max_hr"] and st["min_hr"]:
                 drop = st["max_hr"] - st["min_hr"]

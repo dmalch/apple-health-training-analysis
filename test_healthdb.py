@@ -17,10 +17,13 @@ column, workout activity and duration in `workout_activities`, totals in
 Needs duckdb (see .venv); no other dependencies, no real health data.
 """
 
+import base64
 import contextlib
 import datetime
 import io
+import json
 import os
+import plistlib
 import shutil
 import sqlite3
 import tempfile
@@ -129,6 +132,124 @@ DEVICES = [
 WORKOUT_START = apple_time(2026, 8, 26, 8, 0)
 
 
+class Archived(dict):
+    """A class instance as NSKeyedArchiver writes one: its fields under their own keys."""
+
+    def __init__(self, classname, **fields):
+        super().__init__(fields)
+        self.classname = classname
+
+
+def keyed_archive(root):
+    """Encode `root` the way NSKeyedArchiver lays it out on the device.
+
+    A plain dict becomes an NSDictionary (NS.keys / NS.objects, every value
+    behind a UID); an Archived keeps its fields as keys, numbers inline and
+    strings and objects behind UIDs. Both shapes occur in one real payload.
+    """
+    objects: list[object] = ["$null"]
+    classes = {}
+
+    def class_uid(name):
+        if name not in classes:
+            classes[name] = plistlib.UID(len(objects))
+            objects.append({"$classname": name, "$classes": [name, "NSObject"]})
+        return classes[name]
+
+    def enc(value):
+        if value is None:
+            return plistlib.UID(0)
+        index = len(objects)
+        objects.append(None)
+        obj: object
+        if isinstance(value, Archived):
+            obj = {k: enc(v) if isinstance(v, (dict, str)) else v for k, v in value.items()}
+            obj["$class"] = class_uid(value.classname)
+        elif isinstance(value, dict):
+            obj = {
+                "NS.keys": [enc(k) for k in value],
+                "NS.objects": [enc(v) for v in value.values()],
+                "$class": class_uid("NSDictionary"),
+            }
+        else:
+            obj = value
+        objects[index] = obj
+        return plistlib.UID(index)
+
+    top = enc(root)
+    return plistlib.dumps(
+        {
+            "$version": 100000,
+            "$archiver": "NSKeyedArchiver",
+            "$top": {"root": top},
+            "$objects": objects,
+        },
+        fmt=plistlib.FMT_BINARY,
+    )
+
+
+def plan_step(step_type, seconds, pace_ms=None):
+    """One step of a custom workout, shaped like the watch's own JSON."""
+    goal = Archived(
+        "NLSessionActivityGoal",
+        NLSessionActivityGoalQuantity=Archived(
+            "HKQuantity",
+            ValueKey=float(seconds),
+            UnitKey=Archived("HKTimeUnit", HKUnitStringKey="s"),
+        ),
+        NLSessionActivityGoalValue=float(seconds),
+        NLSessionActivityGoalGoalTypeIdentifier=2,
+    )
+    targets = []
+    if pace_ms is not None:
+        target = {"type": "instantaneous_pace", "min": pace_ms, "max": pace_ms}
+        targets.append(base64.b64encode(json.dumps(target).encode()).decode())
+    return {
+        "stepType": step_type,
+        "goal": base64.b64encode(keyed_archive(goal)).decode(),
+        "targetZoneDatas": targets,
+        "displayName": None,
+    }
+
+
+def plan_config(data):
+    """The `_HKPrivateWorkoutConfiguration` payload: JSON, the plan base64 inside it."""
+    return json.dumps(
+        {
+            "proto_data": "",
+            "version": 1,
+            "type": 2,
+            "data": base64.b64encode(json.dumps(data).encode()).decode(),
+        }
+    ).encode()
+
+
+def step_metadata(key_path):
+    """A block's own metadata plist, naming the plan step it ran."""
+    return keyed_archive(
+        {
+            "WOIntervalStepKeyPath": key_path,
+            "WOIntervalStepSuccessful": True,
+            "HKElevationAscended": Archived(
+                "HKQuantity", ValueKey=100.0, UnitKey=Archived("HKLengthUnit", HKUnitStringKey="cm")
+            ),
+        }
+    )
+
+
+# Warm-up, then work and recovery repeated twice, and an empty cool-down. The
+# session below stops during the second work step.
+FIXTURE_PLAN = {
+    "intervalWorkout": {
+        "name": "Example plan",
+        "warmupBlock": {"steps": [plan_step(2, 600)], "count": 1},
+        "stepBlocks": [{"steps": [plan_step(0, 240, 10 / 3), plan_step(1, 180)], "count": 2}],
+        "cooldownBlock": {"steps": [], "count": 1},
+    },
+    "type": 2,
+}
+
+
 def build_fixture(root):
     """Write the two sqlite files and return the path of the secure one."""
     secure = os.path.join(root, "healthdb_secure.sqlite")
@@ -214,7 +335,20 @@ def build_fixture(root):
     con.executemany(
         "INSERT INTO workout_activities VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         [
-            (10, None, wid, 0, 63, 1, 0, None, WORKOUT_START, WORKOUT_START + 600, 600.0, None),
+            (
+                10,
+                None,
+                wid,
+                0,
+                63,
+                1,
+                0,
+                None,
+                WORKOUT_START,
+                WORKOUT_START + 600,
+                600.0,
+                step_metadata("0.0.0"),
+            ),
             (
                 11,
                 None,
@@ -227,7 +361,7 @@ def build_fixture(root):
                 WORKOUT_START + 600,
                 WORKOUT_START + 840,
                 240.0,
-                None,
+                step_metadata("1.0.0"),
             ),
             (
                 12,
@@ -241,7 +375,7 @@ def build_fixture(root):
                 WORKOUT_START + 840,
                 WORKOUT_START + 1020,
                 180.0,
-                None,
+                step_metadata("1.0.1"),
             ),
             (
                 13,
@@ -255,7 +389,7 @@ def build_fixture(root):
                 WORKOUT_START + 1020,
                 WORKOUT_START + 1234,
                 214.0,
-                None,
+                step_metadata("1.1.0"),
             ),
         ],
     )
@@ -312,7 +446,12 @@ def build_fixture(root):
 
     con.executemany(
         "INSERT INTO metadata_keys VALUES (?,?)",
-        [(1, "HKElevationAscended"), (2, "HKIndoorWorkout"), (3, "HKTimeZone")],
+        [
+            (1, "HKElevationAscended"),
+            (2, "HKIndoorWorkout"),
+            (3, "HKTimeZone"),
+            (4, "_HKPrivateWorkoutConfiguration"),
+        ],
     )
     con.executemany(
         "INSERT INTO metadata_values VALUES (?,?,?,?,?,?,?,?)",
@@ -322,6 +461,8 @@ def build_fixture(root):
             (1, 1, wid, 3, "cm", 122200.0, None, None),
             (2, 2, wid, 1, None, 0.0, None, None),
             (3, 3, wid, 0, "Europe/Rome", None, None, None),
+            # value_type 4, a payload: the custom workout's plan.
+            (4, 4, wid, 4, None, None, None, plan_config(FIXTURE_PLAN)),
         ],
     )
     con.commit()
@@ -525,6 +666,37 @@ class ConverterTest(unittest.TestCase):
         dur = self.con.execute("SELECT duration_min FROM workouts").fetchone()[0]
         self.assertAlmostEqual(dur, 80.0, places=6)
 
+    # ------------------------------------------------------ the watch's plan
+
+    def planned(self):
+        return self.con.execute(
+            "SELECT kind, step_path, goal_value, goal_unit, target_type, target_min, target_max"
+            " FROM workout_blocks WHERE NOT is_primary ORDER BY seq"
+        ).fetchall()
+
+    def test_each_block_is_labelled_from_the_plan(self):
+        # Nothing in the block rows themselves says which is the work. The
+        # plan, joined through each block's step key path, does.
+        self.assertEqual([r[0] for r in self.planned()], ["warmup", "work", "recovery", "work"])
+
+    def test_a_block_stopped_early_keeps_its_planned_goal(self):
+        _kind, path, goal, unit, *_ = self.planned()[3]
+        # Second repetition of the first step block; asked for 240 s, ran 214.
+        self.assertEqual((path, goal, unit), ("1.1.0", 240.0, "s"))
+
+    def test_a_pace_target_is_kept_in_metres_per_second(self):
+        *_, target_type, low, high = self.planned()[1]
+        self.assertEqual(target_type, "instantaneous_pace")
+        self.assertAlmostEqual(low, 10 / 3)
+        self.assertAlmostEqual(high, 10 / 3)
+
+    def test_a_step_without_a_target_has_none(self):
+        self.assertEqual(self.planned()[2][4:], (None, None, None))
+
+    def test_the_whole_session_rows_carry_no_kind(self):
+        kinds = self.con.execute("SELECT kind FROM workout_blocks WHERE is_primary").fetchall()
+        self.assertEqual(kinds, [(None,), (None,)])
+
     # --------------------------------------------------------------- metadata
 
     def test_quantity_metadata_keeps_the_magnitude_not_the_unit(self):
@@ -560,6 +732,53 @@ class ConverterTest(unittest.TestCase):
             "SELECT DISTINCT type_full FROM records WHERE type = 'HeartRate'"
         ).fetchone()[0]
         self.assertEqual(full, "HKQuantityTypeIdentifierHeartRate")
+
+
+class WorkoutPlanTest(unittest.TestCase):
+    """Reading a plan and following a block's key path into it."""
+
+    def test_an_empty_warm_up_is_not_counted_in_the_key_path(self):
+        # A plan without a warm-up still carries an empty warmupBlock, and the
+        # watch numbers only blocks that have steps: "0.0.0" is the first rep.
+        # Indexing the full list ran off the end of the plan.
+        plan = conv.decode_plan(
+            plan_config(
+                {
+                    "intervalWorkout": {
+                        "warmupBlock": {"steps": [], "count": 1},
+                        "stepBlocks": [
+                            {"steps": [plan_step(0, 40), plan_step(1, 20)], "count": 4},
+                            {"steps": [plan_step(1, 0)], "count": 1},
+                        ],
+                        "cooldownBlock": {"steps": [], "count": 1},
+                    }
+                }
+            )
+        )
+        self.assertEqual(conv.plan_step(plan, "0.0.0")["kind"], "work")
+        self.assertEqual(conv.plan_step(plan, "0.3.1")["kind"], "recovery")
+        self.assertEqual(conv.plan_step(plan, "1.0.0")["kind"], "recovery")
+
+    def test_a_goal_workout_has_no_plan(self):
+        # Most workouts carry a configuration too, holding only an open, time
+        # or distance goal. That is not a plan of steps.
+        self.assertIsNone(conv.decode_plan(plan_config({"goal": "", "type": 2})))
+
+    def test_an_unreadable_configuration_is_no_plan_rather_than_an_error(self):
+        self.assertIsNone(conv.decode_plan(b"\x00 not json"))
+        self.assertIsNone(conv.decode_plan(json.dumps({"data": "not base64!"}).encode()))
+
+    def test_a_key_path_outside_the_plan_matches_no_step(self):
+        plan = conv.decode_plan(plan_config(FIXTURE_PLAN))
+        self.assertIsNone(conv.plan_step(plan, "2.0.0"))
+        self.assertIsNone(conv.plan_step(plan, "1.0.5"))
+        self.assertIsNone(conv.plan_step(plan, "not a path"))
+        self.assertIsNone(conv.plan_step(plan, None))
+
+    def test_the_key_path_is_read_from_a_blocks_metadata(self):
+        self.assertEqual(conv.step_key_path(step_metadata("1.2.0")), "1.2.0")
+        self.assertIsNone(conv.step_key_path(keyed_archive({"HKIndoorWorkout": 0})))
+        self.assertIsNone(conv.step_key_path(b"not a plist"))
 
 
 if __name__ == "__main__":

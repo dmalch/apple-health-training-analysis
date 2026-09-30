@@ -131,10 +131,12 @@ rep: pace, average and peak HR, HR entering and leaving the rep, and how much of
 rep was spent above 90% of max. Recoveries get their HR drop.
 
 Rep detection tries three sources in order — structured `workout_blocks`, then the
-watch's lap markers, then GPS speed. The structure carries exact boundaries. The backup
-also records which step each block was, but the converter does not carry that across
-yet, so which block is work is read from pace, not heart rate, whenever the route covers
-the session (see [apple-health.md](apple-health.md#structured-workout-blocks-workout_activities--workout_blocks)
+watch's lap markers, then GPS speed. The structure carries exact boundaries, and on a
+database converted from a backup it also carries which step each block was, straight
+from the watch's plan, with the pace target the plan set; each rep's pace is reported
+against it. Without the plan, which block is work is read from pace, not heart rate,
+whenever the route covers the session (see
+[apple-health.md](apple-health.md#structured-workout-blocks-workout_activities--workout_blocks)
 for both). The report says which it used, and `--expect-reps` flags a plan
 whose work-block count differs from the one you meant to run.
 

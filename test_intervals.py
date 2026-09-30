@@ -64,7 +64,7 @@ def heart_rate():
 def work(structure):
     """The work bouts out of what blocks_from_structure returns."""
     blocks, _signal = structure
-    return [(a, b) for kind, a, b in blocks if kind == "work"]
+    return [(b.start, b.end) for b in blocks if b.kind == "work"]
 
 
 class StructuredBlockTest(unittest.TestCase):
@@ -99,7 +99,7 @@ class StructuredBlockTest(unittest.TestCase):
 
     def test_every_block_is_labelled_warm_up_and_cool_down_included(self):
         blocks, signal = ai.blocks_from_structure(self.con, 1, heart_rate())
-        self.assertEqual([kind for kind, _a, _b in blocks], [kind for kind, *_ in BLOCKS])
+        self.assertEqual([b.kind for b in blocks], [kind for kind, *_ in BLOCKS])
         # No route here, so heart rate is all there is to go by.
         self.assertEqual(signal, "heart rate")
 
@@ -120,7 +120,7 @@ class StructuredBlockTest(unittest.TestCase):
             self.con, 1, [], [], [], None, io.StringIO(), hr_by_t=heart_rate()
         )
         self.assertEqual(how, "structure")
-        self.assertEqual(sum(kind == "work" for kind, _a, _b in blocks), 4)
+        self.assertEqual(sum(b.kind == "work" for b in blocks), 4)
 
     def test_find_reps_still_falls_back_when_there_is_no_structure(self):
         self.con.execute("DELETE FROM workout_blocks WHERE NOT is_primary")
@@ -217,7 +217,7 @@ class PaceBeforeHeartRateTest(unittest.TestCase):
     def test_every_block_is_labelled_by_pace(self):
         blocks, signal = ai.blocks_from_structure(self.con, 1, self.hr, self.times, self.cum)
         self.assertEqual(signal, "pace")
-        self.assertEqual([kind for kind, _a, _b in blocks], [kind for kind, *_ in STRIDES])
+        self.assertEqual([b.kind for b in blocks], [kind for kind, *_ in STRIDES])
 
     def test_without_a_route_heart_rate_is_used_and_the_report_says_so(self):
         out = io.StringIO()
@@ -287,6 +287,16 @@ LAG_S = 45
 # One sample far above anything sustained, the way a strap artifact reads.
 SPIKE_S, SPIKE_BPM = 300, 199
 
+# What the watch's own plan says of each STRIDES block, as the converter stores
+# it: the kind, and the pace target in m/s -- 6:10/km for the tempo block, 5:00/km
+# for the strides.
+STRIDES_PLAN = [
+    ("warmup", None),
+    ("work", 1000 / 370),
+    *[("work", 1000 / 300), ("recovery", None)] * 4,
+    ("cooldown", None),
+]
+
 
 def bulk_insert(con, table, rows, beside):
     """Load rows through a CSV: executemany takes seconds over a session's worth."""
@@ -299,8 +309,12 @@ def bulk_insert(con, table, rows, beside):
     os.remove(staging)
 
 
-def session_db(path, plan=STRIDES, base=STRIDES_BASE, sensor="strap"):
-    """Write a one-workout database with the tables analyze_intervals.py reads."""
+def session_db(path, plan=STRIDES, base=STRIDES_BASE, sensor="strap", recorded=None):
+    """Write a one-workout database with the tables analyze_intervals.py reads.
+
+    `recorded` is the watch's plan per block, (kind, pace target in m/s), as a
+    converter that reads it stores them; None builds the older table without.
+    """
 
     def at_(s):
         return base + datetime.timedelta(seconds=s)
@@ -379,7 +393,62 @@ def session_db(path, plan=STRIDES, base=STRIDES_BASE, sensor="strap"):
             "INSERT INTO workout_blocks VALUES (1, ?, false, ?, ?, ?)",
             [i, at_(lo), at_(hi), (hi - lo) / 60],
         )
+    if recorded is not None:
+        con.execute(
+            "ALTER TABLE workout_blocks ADD COLUMN kind VARCHAR;"
+            "ALTER TABLE workout_blocks ADD COLUMN target_type VARCHAR;"
+            "ALTER TABLE workout_blocks ADD COLUMN target_min DOUBLE;"
+            "ALTER TABLE workout_blocks ADD COLUMN target_max DOUBLE;"
+        )
+        for i, (kind, pace_ms) in enumerate(recorded, 1):
+            con.execute(
+                "UPDATE workout_blocks SET kind = ?, target_type = ?, target_min = ?,"
+                " target_max = ? WHERE NOT is_primary AND seq = ?",
+                [kind, pace_ms and "instantaneous_pace", pace_ms, pace_ms, i],
+            )
     con.close()
+
+
+class RecordedPlanTest(unittest.TestCase):
+    """A database whose converter read the watch's plan: no inference needed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="intervals-plan-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def structure(self, plan=STRIDES, recorded=STRIDES_PLAN):
+        session_db(self.tmp / "t.duckdb", plan=plan, recorded=recorded)
+        con = duckdb.connect(str(self.tmp / "t.duckdb"))
+        self.addCleanup(con.close)
+        self.con = con
+        points = con.execute("SELECT t, lat, lon, ele, speed_ms FROM route_points ORDER BY t")
+        points = points.fetchall()
+        cum, _speeds = ai.build_distance(points)
+        hr = con.execute("SELECT t, bpm FROM hr ORDER BY t").fetchall()
+        return ai.blocks_from_structure(con, 1, hr, [p[0] for p in points], cum)
+
+    def test_the_plan_labels_a_recovery_that_was_run_like_a_rep(self):
+        # The last recovery run at stride pace. By effort it is work, and the
+        # inference says so; the plan says it was a recovery, and that is what
+        # the watch knew.
+        fast_rest = [*STRIDES[:-2], ("recovery", 120, 3.1, 150), STRIDES[-1]]
+        blocks, signal = self.structure(plan=fast_rest)
+        self.assertEqual(signal, "the watch's plan")
+        self.assertEqual([b.kind for b in blocks], [kind for kind, _pace in STRIDES_PLAN])
+
+    def test_a_partly_labelled_plan_is_not_mixed_with_inference(self):
+        recorded = [*STRIDES_PLAN[:-1], (None, None)]
+        _blocks, signal = self.structure(recorded=recorded)
+        self.assertEqual(signal, "pace")
+
+    def test_each_block_carries_its_planned_pace(self):
+        blocks, _signal = self.structure()
+        self.assertIsNone(blocks[0].target_pace)
+        target = blocks[1].target_pace
+        assert target is not None, "the tempo block lost its planned pace"
+        fastest, slowest = target
+        self.assertAlmostEqual(fastest, 370 / 60)
+        self.assertAlmostEqual(slowest, 370 / 60)
 
 
 class CommandLineTest(unittest.TestCase):
@@ -437,6 +506,15 @@ class CommandLineTest(unittest.TestCase):
         self.assertIn("warm-up", result.stdout)
         self.assertIn("cool-down", result.stdout)
         self.assertNotIn("NOTE", result.stdout)
+
+    def test_each_rep_is_set_against_the_pace_it_was_planned_at(self):
+        session_db(self.db, recorded=STRIDES_PLAN)
+        result = self.run_cli("--max-hr", "190")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("told apart by the watch's plan", result.stdout)
+        (line,) = [ln for ln in result.stdout.splitlines() if "pace per rep" in ln]
+        self.assertEqual(line.count("(plan 6:10)"), 1, line)
+        self.assertEqual(line.count("(plan 5:00)"), 4, line)
 
     def test_a_plan_that_disagrees_with_expect_reps_is_flagged(self):
         session_db(self.db)
