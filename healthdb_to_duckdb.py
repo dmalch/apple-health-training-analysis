@@ -241,6 +241,9 @@ OTHER_TYPES = {
     144: ("Electrocardiogram", "HKDataTypeIdentifierElectrocardiogram"),
 }
 
+# `objects.type` of a deleted sample. See build().
+DELETED_OBJECT = 2
+
 # healthdb_secure stores quantities in HealthKit's canonical SI units, while
 # export.xml carries the display units. Heart rate is the one that matters: the
 # database says 2.7 (count/s), the XML says 162 bpm. Every factor below was
@@ -680,12 +683,21 @@ def build(db_path, out_db, tz_default):
     has_category = "category_samples" in cols
     qty = "LEFT JOIN hk.quantity_samples q ON q.data_id = s.data_id" if has_quantity else ""
     cat = "LEFT JOIN hk.category_samples c ON c.data_id = s.data_id" if has_category else ""
+    keep = []
     # The workout object is itself a row in `samples`; the XML pipeline keeps
     # workouts out of `records`, so drop them here too rather than leaving a
     # data_type 0 row per session in the census.
-    workout_filter = (
-        "WHERE s.data_id NOT IN (SELECT data_id FROM hk.workouts)" if "workouts" in cols else ""
-    )
+    if "workouts" in cols:
+        keep.append("s.data_id NOT IN (SELECT data_id FROM hk.workouts)")
+    # A deleted sample keeps its `objects` row, marked type 2 -- the schema's own
+    # partial index on that value is called `objects_deleted` -- and its `samples`
+    # row, and loses everything else. Read in, it is a timestamp with no value.
+    # The phone deletes the originals when it packs a workout's samples into a
+    # quantity series 120 days on, and one backup carried 36,914 of these, 4,857
+    # of them heart rate. Live objects are type 1 on the device.
+    if "type" in cols["objects"]:
+        keep.append(f"o.type IS DISTINCT FROM {DELETED_OBJECT}")
+    live_filter = f"WHERE {' AND '.join(keep)}" if keep else ""
     qty_val = "q.quantity" if has_quantity else "NULL"
     qty_unit = (
         "q.original_unit"
@@ -718,7 +730,7 @@ def build(db_path, out_db, tz_default):
             {src_lookup}
             {qty}
             {cat}
-            {workout_filter}
+            {live_filter}
         )
         SELECT
             id,
@@ -742,6 +754,13 @@ def build(db_path, out_db, tz_default):
     """)
     n = con.execute("SELECT count(*) FROM records").fetchone()[0]
     print(f"  records              {n:>12,} rows  ({time.time() - t0:.1f}s)", file=sys.stderr)
+    if "type" in cols["objects"]:
+        n = con_sq.execute(
+            "SELECT count(*) FROM objects WHERE type = ?", (DELETED_OBJECT,)
+        ).fetchone()[0]
+        print(f"    deleted, skipped   {n:>12,} rows", file=sys.stderr)
+    for name, n in valueless_records(con):
+        print(f"  WARNING: {n:,} {name} records carry no value", file=sys.stderr)
 
     build_workouts(con, cols, tz_default, dev_expr, dev_lookup, src_expr, src_lookup)
     build_blocks(con, con_sq, cols)
@@ -1277,6 +1296,71 @@ def stub_missing(con):
 # ---------------------------------------------------------------- verification
 
 
+def valueless_records(con):
+    """(type, rows) for every quantity or category type with rows lacking a value.
+
+    Never legitimate: a quantity sample is its value. The other kinds -- routes,
+    heartbeat series, ECGs -- are left out, since they have no value column to
+    fill.
+    """
+    quantity = ", ".join(str(c) for c in sorted(QUANTITY_TYPES))
+    category = ", ".join(str(c) for c in sorted(CATEGORY_TYPES))
+    return con.execute(f"""
+        SELECT type, count(*) FROM records
+        WHERE (type_code IN ({quantity}) AND value IS NULL)
+           OR (type_code IN ({category}) AND value_text IS NULL)
+        GROUP BY 1 ORDER BY 2 DESC, 1
+    """).fetchall()
+
+
+# A day's mean heart rate may differ by this much before --verify calls it a
+# different day. The routes file a sample near midnight under different days, and
+# on 1,596 days whose counts matched, that alone moved the mean by up to 1.24 bpm.
+MEAN_BPM_TOLERANCE = 1.5
+
+
+def hr_day_diffs(con):
+    """Days whose heart rate differs from the XML database's, most recent first.
+
+    `con` has the XML database attached as `old`. A day differs in its sample
+    count, in samples without a value, or in its mean -- counts alone once
+    matched on days where thousands of samples had lost their values. Only days
+    both databases cover completely are compared: the export's last day is
+    partial and everything after it is missing, not different.
+
+    Rows: (day, live n, xml n, live n without a value, live mean, xml mean,
+    live rows spanning time, xml rows spanning time). A spanning row is usually
+    a quantity series flattened to one value; more of them on the live side
+    means the phone packed that day into series after the export.
+    """
+    return con.execute(f"""
+        WITH shared AS (
+            SELECT min(local_date) AS lo, max(local_date) AS hi
+            FROM old.records WHERE type = 'HeartRate'
+        ),
+        per_day AS (
+            SELECT local_date, count(*) AS n, count(*) FILTER (value IS NULL) AS no_value,
+                   avg(value) AS bpm, count(*) FILTER (end_date > start_date) AS spans
+            FROM records WHERE type = 'HeartRate' GROUP BY 1
+        ),
+        old_per_day AS (
+            SELECT local_date, count(*) AS n, avg(value) AS bpm,
+                   count(*) FILTER (end_date > start_date) AS spans
+            FROM old.records WHERE type = 'HeartRate' GROUP BY 1
+        )
+        SELECT coalesce(a.local_date, b.local_date) AS d,
+               coalesce(a.n, 0), coalesce(b.n, 0), coalesce(a.no_value, 0),
+               a.bpm, b.bpm, coalesce(a.spans, 0), coalesce(b.spans, 0)
+        FROM per_day a FULL JOIN old_per_day b USING (local_date), shared
+        WHERE coalesce(a.local_date, b.local_date) >= shared.lo
+          AND coalesce(a.local_date, b.local_date) < shared.hi
+          AND (coalesce(a.n, 0) <> coalesce(b.n, 0)
+               OR a.no_value > 0
+               OR abs(a.bpm - b.bpm) > {MEAN_BPM_TOLERANCE})
+        ORDER BY d DESC
+    """).fetchall()
+
+
 def verify(new_db, xml_db):
     """Compare against an XML-derived database over the days they share.
 
@@ -1285,21 +1369,36 @@ def verify(new_db, xml_db):
     """
     con = duckdb.connect(new_db)
     con.execute(f"ATTACH '{xml_db}' AS old (READ_ONLY)")
-    print("\nday-by-day HeartRate counts, this DB vs XML DB:")
-    rows = con.execute("""
-        -- `xml` is a reserved word in DuckDB, hence xml_n.
-        SELECT coalesce(a.local_date, b.local_date) AS d,
-               a.n AS live, b.n AS xml_n, coalesce(a.n, 0) - coalesce(b.n, 0) AS diff
-        FROM (SELECT local_date, count(*) n FROM hr GROUP BY 1) a
-        FULL JOIN (SELECT local_date, count(*) n FROM old.hr GROUP BY 1) b
-             ON a.local_date = b.local_date
-        WHERE coalesce(a.n, 0) <> coalesce(b.n, 0)
-        ORDER BY d DESC LIMIT 25
-    """).fetchall()
+
+    print("\nquantity and category records without a value (any is a converter bug):")
+    rows = valueless_records(con)
+    if not rows:
+        print("  none")
+    for t, n in rows:
+        print(f"  {t:<32} {n:>10,}")
+
+    print("\nday-by-day HeartRate, this DB vs XML DB, on the days both cover:")
+    rows = hr_day_diffs(con)
+
+    # Furthest apart first. Newest first, the days that differ trivially filled
+    # the list and the ones that mattered never showed.
+    def apart(row):
+        _d, live, xml, no_value, live_bpm, xml_bpm = row[:6]
+        count = abs(live - xml) / max(xml, 1)
+        mean = abs((live_bpm or 0) - (xml_bpm or 0)) / (xml_bpm or 1)
+        return no_value > 0, max(count, mean)
+
+    rows.sort(key=apart, reverse=True)
     if not rows:
         print("  identical on every shared day")
-    for d, live, xml, diff in rows:
-        print(f"  {d}  live={live or 0:>7,}  xml={xml or 0:>7,}  diff={diff:+,}")
+    else:
+        print(f"  {len(rows):,} days differ; the 25 furthest apart (spans: rows covering time)")
+    for d, live, xml, no_value, live_bpm, xml_bpm, live_spans, xml_spans in rows[:25]:
+        mean = f"{live_bpm or 0:5.1f} vs {xml_bpm or 0:5.1f}"
+        print(
+            f"  {d}  live={live:>7,}  xml={xml:>7,}  diff={live - xml:+7,}  "
+            f"no value={no_value:>5,}  mean {mean}  spans {live_spans}/{xml_spans}"
+        )
 
     # The scale check is the one that catches silent unit bugs: HealthKit's
     # canonical units are not the XML's display units, so a type whose ratio is

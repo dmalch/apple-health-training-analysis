@@ -88,12 +88,17 @@ session-level classification rather than time in zone.
 Not every session qualifies. A workout needs samples spanning at least 60% of its
 duration (`MIN_ZONE_COVERAGE`), with each sample counting for at most 15 s
 (`MAX_SAMPLE_GAP_S`). Below that the stream is too thin to describe the session and it
-keeps the average-based treatment. Typically fewer than half of aerobic sessions
-qualify — the rest are activities the watch barely samples, like an elliptical at 19
-samples per 27 minutes.
+keeps the average-based treatment. **In practice that means the last four months.**
+The phone packs a workout's heart-rate stream into series 120 days after the fact,
+and both routes read each series as one row (`docs/apple-health.md`), so an older
+28-minute elliptical session that recorded about 200 readings shows two or three. Of
+926 sessions packed that way in one backup, one qualified; of the 97 younger than
+120 days, 81 did. A session that falls out of the per-sample split as it ages has not
+changed — only what the phone still keeps of it.
 
-Only samples with a value count, for coverage as well as for zones. The backup route
-can carry a sample's timestamp without its value, and counting those let a session
+Only samples with a value count, for coverage as well as for zones. A backup-route
+database built before the converter skipped deleted samples carries each one as a
+timestamp without a value (see `docs/apple-health.md`), and counting those let a session
 built almost entirely from them pass the 60% check with no time in any zone — which
 the session count then filed under Z1, because every zone tied at zero. Samples that
 share a timestamp are ordered by value, so the seconds until the next sample go to

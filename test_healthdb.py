@@ -272,11 +272,26 @@ def build_fixture(root):
             con.execute("INSERT INTO category_samples VALUES (?,?)", (did, category))
         return did
 
+    def tombstone(data_type, start, provenance):
+        """What iOS 27 keeps of a deleted sample: the `objects` row, now type 2,
+        and the `samples` row. The quantity, category and metadata are gone."""
+        next_id[0] += 1
+        did = next_id[0]
+        con.execute("INSERT INTO objects VALUES (?,?,?,?,?)", (did, None, provenance, 2, start))
+        con.execute("INSERT INTO samples VALUES (?,?,?,?)", (did, start, start, data_type))
+        return did
+
     t = apple_time(2026, 8, 26, 12, 0)
     # Heart rate is stored in count/SECOND: 2.7 is 162 bpm, not 2.7 bpm.
     sample(5, t, t, 2, quantity=2.7)  # strap
     sample(5, t + 1, t + 1, 1, quantity=2.0)  # watch  -> 120
     sample(5, t + 2, t + 2, 3, quantity=2.5)  # airpods -> 150
+    # Readings the phone deleted when it packed the day into a series. They read
+    # as a timestamp with no value, and the first shares its instant with a live
+    # reading -- the tie that made analyze.py's zones change between runs.
+    tombstone(5, t + 1, 1)
+    tombstone(5, t + 3, 3)
+    tombstone(10, t, 1)  # not only heart rate: energy went the same way
     # Resting heart rate is NOT per-second; scaling it too would read 2880 bpm.
     sample(118, t, t, 1, quantity=48.0)
     sample(8, t, t, 1, quantity=5000.0)  # metres  -> 5 km
@@ -542,6 +557,27 @@ class ConverterTest(unittest.TestCase):
         self.assertEqual(got.get("watch"), 2)
         self.assertNotIn("other", got)
 
+    # -------------------------------------------------------------- deletions
+
+    def deleted_ids(self):
+        sq = sqlite3.connect(os.path.join(self.tmp, "healthdb_secure.sqlite"))
+        try:
+            return [r[0] for r in sq.execute("SELECT data_id FROM objects WHERE type = 2")]
+        finally:
+            sq.close()
+
+    def test_deleted_samples_are_not_records(self):
+        ids = self.deleted_ids()
+        self.assertEqual(len(ids), 3)
+        n = self.con.execute(
+            f"SELECT count(*) FROM records WHERE id IN ({', '.join('?' * len(ids))})", ids
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_no_heart_rate_sample_is_without_a_value(self):
+        n = self.con.execute("SELECT count(*) FROM hr WHERE bpm IS NULL").fetchone()[0]
+        self.assertEqual(n, 0)
+
     def test_source_names_come_from_the_companion_database(self):
         names = {r[0] for r in self.con.execute("SELECT DISTINCT source_name FROM hr").fetchall()}
         self.assertEqual(names, {"Example Apple Watch", "Bluetooth Device", "Example AirPods Pro"})
@@ -779,6 +815,74 @@ class WorkoutPlanTest(unittest.TestCase):
         self.assertEqual(conv.step_key_path(step_metadata("1.2.0")), "1.2.0")
         self.assertIsNone(conv.step_key_path(keyed_archive({"HKIndoorWorkout": 0})))
         self.assertIsNone(conv.step_key_path(b"not a plist"))
+
+
+class VerifyTest(unittest.TestCase):
+    """--verify has to see a wrong value, not only a missing row.
+
+    4,857 deleted heart-rate samples passed it: the live database had a row
+    without a value wherever the XML database had one with a value, so the
+    per-day counts matched. And the days it did flag never reached the screen,
+    because the days after the XML snapshot filled its list first.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="healthdb-verify-")
+        secure = build_fixture(cls.tmp)
+        cls.xml = os.path.join(cls.tmp, "xml.duckdb")
+        with contextlib.redirect_stderr(io.StringIO()):
+            conv.build(secure, cls.xml, "Europe/Berlin")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    # The watch reading of 26 Aug; the one of the 27th reads 120 too.
+    WATCH = "type = 'HeartRate' AND local_date = DATE '2026-08-26' AND value = 120"
+
+    def live(self, *edits):
+        """A copy of the reference with `edits` applied, the reference attached as `old`."""
+        path = os.path.join(self.tmp, f"{self._testMethodName}.duckdb")
+        shutil.copy(self.xml, path)
+        con = duckdb.connect(path)
+        self.addCleanup(con.close)
+        for sql in edits:
+            con.execute(sql)
+        con.execute(f"ATTACH '{self.xml}' AS old (READ_ONLY)")
+        return con
+
+    def test_identical_databases_report_nothing(self):
+        con = self.live()
+        self.assertEqual(conv.hr_day_diffs(con), [])
+        self.assertEqual(conv.valueless_records(con), [])
+
+    def test_a_sample_without_a_value_is_reported_although_the_counts_match(self):
+        con = self.live(f"UPDATE records SET value = NULL WHERE {self.WATCH}")
+        self.assertEqual(conv.valueless_records(con), [("HeartRate", 1)])
+        rows = conv.hr_day_diffs(con)
+        self.assertEqual(len(rows), 1)
+        day, live_n, xml_n, no_value = rows[0][:4]
+        self.assertEqual(str(day), "2026-08-26")
+        self.assertEqual(live_n, xml_n)
+        self.assertEqual(no_value, 1)
+
+    def test_a_changed_value_is_reported_although_the_counts_match(self):
+        con = self.live(f"UPDATE records SET value = 130 WHERE {self.WATCH}")
+        rows = conv.hr_day_diffs(con)
+        self.assertEqual(len(rows), 1)
+        _day, live_n, xml_n, no_value, live_bpm, xml_bpm = rows[0][:6]
+        self.assertEqual((live_n, no_value), (xml_n, 0))
+        self.assertAlmostEqual(live_bpm - xml_bpm, 10 / 3, places=6)
+
+    def test_days_past_the_xml_snapshot_are_not_differences(self):
+        # The live database always runs on past the export. Counted as
+        # mismatches, those days filled the 25-line list on their own.
+        con = self.live(
+            "INSERT INTO records SELECT * REPLACE (DATE '2026-09-15' AS local_date)"
+            f" FROM records WHERE {self.WATCH}"
+        )
+        self.assertEqual(conv.hr_day_diffs(con), [])
 
 
 if __name__ == "__main__":

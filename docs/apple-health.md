@@ -143,6 +143,48 @@ Loses: `activity_summary` is an empty stub on this route (the data is in
 `activity_caches`, not yet unpacked), and a handful of very recent workouts may have
 no XML counterpart.
 
+### Workout heart rate older than 120 days is packed into series
+
+**Both routes lose a session's heart-rate stream once it is four months old.** The
+phone packs the dense samples a workout records into quantity series 120 days after
+the fact: one `samples` row per series, `quantity_sample_series` holding its point
+count and `hfd_key`, and the points in `quantity_series_data`, keyed by
+`series_identifier` = `hfd_key` — the same not-the-`data_id` trap as the routes.
+Point timestamps are absolute on the HealthKit epoch and values are canonical
+(count/s). In one backup every one of the 4,113 packed heart-rate series lay inside a
+workout; 832 were created 120 days to the day after they ended, and the history before
+them was worked through as a backlog over the eight months after the phone's first
+iOS 26 build.
+
+A series comes out as **one row**, on both routes. `quantity_samples` gives it a single
+value that is not the mean of its points (3 bpm above it on one), and it spans a
+median 14 minutes and 119 points. The XML export writes one `<Record>` per series too,
+so switching routes does not help. That backup held 4,255 heart-rate series with
+441,363 points between them, and nothing here reads the points yet. What it costs is
+per-sample zones: a 32-minute run reads as three heart-rate rows, and of 926
+sessions with packed heart rate, one still qualifies for real time in zone
+(`docs/method.md`), against 81 of the 97 sessions younger than 120 days.
+
+Only the dense in-workout stream is packed. The watch's background readings stay
+individual samples, and so does a chest strap's stream: on a strap day the watch was
+packed and 2,787 strap samples were not. Energy, distance and steps are packed the same
+way, but there a series' value is the sum of its points, so daily totals survive to the
+decimal while their row counts drop about tenfold.
+
+The points are **run-length encoded**: consecutive identical readings become one point
+whose `duration` spans them. On five days packed on iOS 27, 4,857 samples became 3,661
+points, and each of the other 1,196 lay inside a point's duration, with the same value
+in the XML export. Reading them back needs that duration, and a point can span more
+than the 15 s `MAX_SAMPLE_GAP_S` credits a sample with.
+
+**So an XML export and a later backup disagree on every day that turned 120 days old in
+between**, and not by a handful. Against an export five weeks older, a backup had lost
+15% to 87% of the heart-rate rows on each workout day of the month that aged past 120
+days in between (one day: 522 against 2,170), and the day's mean fell by up to 50 bpm,
+because the workout stream
+shrank to a few rows while the background readings stayed. The strap days lost the
+least and kept their mean.
+
 ### Structured-workout blocks: `workout_activities` → `workout_blocks`
 
 This is the table to reach for whenever a session was run as a custom workout on the
@@ -273,21 +315,46 @@ across sessions has to come from the same method.**
   here. Codes that are neither quantity nor category were identified by which side
   table they join: 79 → `workouts`, 76 → `activity_caches`, 102 → `data_series`
   (routes), 119 → `binary_samples` (heartbeat series), 144 → `ecg_samples`.
-- `--verify <xml-built.duckdb>` is the acceptance test: per-day HeartRate counts, the
-  per-type value-scale ratio, and workouts matched on start time. Run it while both
-  sources still overlap, because that window closes.
-- When it was last verified against a real backup, per-day HR counts matched the XML
+- `--verify <xml-built.duckdb>` is the acceptance test: quantity and category rows
+  without a value, each day's HeartRate count, completeness and mean over the days both
+  databases cover, the per-type value-scale ratio, and workouts matched on start time.
+  Run it while both sources still overlap, because that window closes — and read the
+  days packed after the export as the phone's doing, not the converter's (*Workout
+  heart rate older than 120 days is packed into series*, above). Those days also push
+  energy, distance and steps 2–10% off in the scale check, since a packed row is a sum;
+  leave them out and every ratio is 1.0. That is not a unit bug.
+- When it was first verified against a real backup, per-day HR counts matched the XML
   database on every shared day bar a handful within ±30 samples, every type's value
   scale was within 2%, and there was **no** case where the XML had a heart rate and
   the backup database did not — while the backup route filled in average HR for
-  hundreds of workouts where the XML has none.
-- **Matching counts are not matching values.** A `samples` row with no
-  `quantity_samples` row comes through with its timestamp and a NULL `value`. One live
-  database carried 4,857 HeartRate samples like that, watch and AirPods, all on the
-  workout days of one ten-day stretch — and the XML export has a value for every one of
-  them. `--verify` compares per-day counts, so it passed. Why the quantity is missing
-  is not traced yet. Anything reading `hr` has to drop `bpm IS NULL` before measuring
-  gaps or coverage; `analyze.py` does.
+  hundreds of workouts where the XML has none. Four weeks later the phone had packed
+  a month of those days into series.
+- **A deleted sample is still a `samples` row.** The phone keeps its `objects` row with
+  `type = 2` — the schema's own partial index on that value is named `objects_deleted`
+  — and its `samples` row, and drops the quantity, the category value, the metadata and
+  the associations; its `creation_date` becomes the time of deletion. Read like a live
+  sample it is a timestamp with a NULL `value`. One backup held 36,914: 32k energy,
+  distance and step rows, 4,857 heart rate from the watch and AirPods, and a few hundred
+  resting heart rate, sleep and walking averages. The heart-rate ones were the originals
+  of five workout days packed on iOS 27, each deleted 120 days after its day, which is
+  why an XML export taken before had a value at every one of their instants. 35 shared
+  an instant with a live reading, which made `analyze.py`'s zones change between runs,
+  and `analyze_intervals.py` crashed on all seven sessions that held any. The converter now
+  skips `objects.type = 2` and warns if a quantity or category row still arrives without
+  a value. Days packed earlier, on iOS 26, had none left; whether iOS 26 never kept
+  them or the phone purges them is not known — the oldest in that backup was 11 days old.
+- **Matching counts are not matching values, and a list capped at 25 lines hides
+  whatever sorts last.** `--verify` passed all of the above. A deleted sample counted as
+  one row like the reading it replaced, so per-day counts matched, and the days that
+  did differ never reached the screen: the list was ordered newest first, and the days
+  after the export, which differ by definition, filled all 25 lines. It now compares
+  each day's mean and count of rows without a value, keeps to the days both databases
+  cover, says how many days differ, and lists the furthest apart first. Expect hundreds
+  to differ without anything being wrong, because the routes file some samples under
+  different days: near midnight, which moves a day's count by a few and its mean by up
+  to about 1 bpm, and on travel days for hours at a stretch, where a pair of adjacent
+  days swings by hundreds in opposite directions. Over one ten-day trip both databases
+  held the same 5,814 instants and filed 2,850 of them under a different day.
 
 ## Parsing the XML
 

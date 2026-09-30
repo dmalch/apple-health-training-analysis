@@ -128,11 +128,12 @@ FOOT_ACTIVITIES = {
 # zone time out of background sampling.
 #
 # "The next one" has to be the same sample on every run, or the same database
-# gives a different report each time. Two things broke that. The backup route
-# carries some samples with a timestamp and no value; left in, one took the
-# seconds from the real reading beside it and still counted as coverage, so a
-# session made mostly of them passed MIN_ZONE_COVERAGE with no time in any zone.
-# They are dropped before the gap is taken. And samples can share a timestamp,
+# gives a different report each time. Two things broke that. A backup-route
+# database built before the converter skipped deleted samples carries each one
+# as a timestamp with no value; left in, one took the seconds from the real
+# reading beside it and still counted as coverage, so a session made mostly of
+# them passed MIN_ZONE_COVERAGE with no time in any zone. They are dropped
+# before the gap is taken. And samples can share a timestamp,
 # so every window here orders by value after time -- ordered by time alone,
 # which of a tied pair took the gap was the database's choice, and one session's
 # dominant zone moved between Z1 and Z3 from run to run.
