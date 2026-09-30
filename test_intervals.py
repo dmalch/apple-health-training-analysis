@@ -38,13 +38,13 @@ BASE = datetime.datetime(2026, 9, 3, 9, 35, 51, tzinfo=datetime.UTC)
 BLOCKS = [
     ("warmup", 0, 600, 136),
     ("work", 600, 840, 175),
-    ("rest", 840, 1020, 138),
+    ("recovery", 840, 1020, 138),
     ("work", 1020, 1260, 177),
-    ("rest", 1260, 1440, 148),
+    ("recovery", 1260, 1440, 148),
     ("work", 1440, 1680, 180),
-    ("rest", 1680, 1860, 154),
+    ("recovery", 1680, 1860, 154),
     ("work", 1860, 2073, 180),
-    ("rest", 2073, 2253, 157),
+    ("recovery", 2073, 2253, 157),
     ("cooldown", 2253, 2553, 126),
 ]
 
@@ -61,6 +61,12 @@ def heart_rate():
     return sorted(out)
 
 
+def work(structure):
+    """The work bouts out of what blocks_from_structure returns."""
+    blocks, _signal = structure
+    return [(a, b) for kind, a, b in blocks if kind == "work"]
+
+
 class StructuredBlockTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="intervals-test-")
@@ -70,7 +76,7 @@ class StructuredBlockTest(unittest.TestCase):
                 workout_id BIGINT, seq BIGINT, is_primary BOOLEAN,
                 start_date TIMESTAMPTZ, end_date TIMESTAMPTZ, duration_min DOUBLE)""")
         self.con.execute(
-            "INSERT INTO workout_blocks VALUES (1, 0, true, ?, ?, ?)", [at(0), at(2553), 2553 / 60]
+            "INSERT INTO workout_blocks VALUES (1, 1, true, ?, ?, ?)", [at(0), at(2553), 2553 / 60]
         )
         for i, (_kind, start, end, _bpm) in enumerate(BLOCKS, 1):
             self.con.execute(
@@ -86,29 +92,35 @@ class StructuredBlockTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_the_four_work_bouts_are_found(self):
-        bounds = ai.work_blocks_from_structure(self.con, 1, heart_rate())
+        bounds = work(ai.blocks_from_structure(self.con, 1, heart_rate()))
         self.assertEqual(
             bounds, [(at(start), at(end)) for kind, start, end, _ in BLOCKS if kind == "work"]
         )
+
+    def test_every_block_is_labelled_warm_up_and_cool_down_included(self):
+        blocks, signal = ai.blocks_from_structure(self.con, 1, heart_rate())
+        self.assertEqual([kind for kind, _a, _b in blocks], [kind for kind, *_ in BLOCKS])
+        # No route here, so heart rate is all there is to go by.
+        self.assertEqual(signal, "heart rate")
 
     def test_a_late_recovery_above_the_session_mean_is_not_a_rep(self):
         # The last recovery sits at 157 bpm against a session mean near 150. A
         # threshold on the mean calls it work; only comparing each block with
         # its neighbours keeps it out.
-        bounds = ai.work_blocks_from_structure(self.con, 1, heart_rate())
+        bounds = work(ai.blocks_from_structure(self.con, 1, heart_rate()))
         self.assertNotIn((at(2073), at(2253)), bounds)
 
     def test_the_truncated_fourth_bout_keeps_its_real_length(self):
-        bounds = ai.work_blocks_from_structure(self.con, 1, heart_rate())
+        bounds = work(ai.blocks_from_structure(self.con, 1, heart_rate()))
         last = bounds[-1]
         self.assertEqual((last[1] - last[0]).total_seconds(), 213.0)
 
     def test_find_reps_prefers_the_structured_blocks(self):
-        bounds, how = ai.find_reps(
+        blocks, how = ai.find_reps(
             self.con, 1, [], [], [], None, io.StringIO(), hr_by_t=heart_rate()
         )
         self.assertEqual(how, "structure")
-        self.assertEqual(len(bounds), 4)
+        self.assertEqual(sum(kind == "work" for kind, _a, _b in blocks), 4)
 
     def test_find_reps_still_falls_back_when_there_is_no_structure(self):
         self.con.execute("DELETE FROM workout_blocks WHERE NOT is_primary")
@@ -120,20 +132,98 @@ class StructuredBlockTest(unittest.TestCase):
 
     def test_an_unstructured_workout_yields_nothing(self):
         self.con.execute("DELETE FROM workout_blocks WHERE NOT is_primary")
-        self.assertEqual(ai.work_blocks_from_structure(self.con, 1, heart_rate()), [])
+        self.assertEqual(ai.blocks_from_structure(self.con, 1, heart_rate()), ([], None))
 
     def test_a_database_without_the_table_is_not_an_error(self):
         # analyze_intervals.py still runs against the XML-derived database,
         # which has no workout_blocks at all.
         self.con.execute("DROP TABLE workout_blocks")
-        self.assertEqual(ai.work_blocks_from_structure(self.con, 1, heart_rate()), [])
+        self.assertEqual(ai.blocks_from_structure(self.con, 1, heart_rate()), ([], None))
         bounds, _how = ai.find_reps(
             self.con, 1, [], [], [], None, io.StringIO(), hr_by_t=heart_rate()
         )
         self.assertEqual(bounds, [])
 
     def test_no_heart_rate_means_no_answer_rather_than_a_guess(self):
-        self.assertEqual(ai.work_blocks_from_structure(self.con, 1, []), [])
+        self.assertEqual(ai.blocks_from_structure(self.con, 1, []), ([], None))
+
+
+WU, W, R, CD = "warmup", "work", "recovery", "cooldown"
+
+
+class LabelBlocksTest(unittest.TestCase):
+    """Which block is which, from one effort figure per block.
+
+    The figures are unit-free: pace when a route covers the session, heart rate
+    otherwise. Apple's plan is a warm-up, work and recovery steps, a cool-down;
+    `workout_blocks` keeps the steps but not which kind each one was.
+    """
+
+    def test_strides_after_a_tempo_block_are_all_work(self):
+        # A work block can follow a work block. Requiring each rep to be harder
+        # than both neighbours dropped the tempo block, which the first stride
+        # outruns.
+        efforts = [8.0, 9.5, 11.5, 7.5, 11.5, 7.5, 11.5, 7.5, 11.5, 7.5, 8.0]
+        self.assertEqual(ai.label_blocks(efforts), [WU, W, W, R, W, R, W, R, W, R, CD])
+
+    def test_a_set_rest_after_a_recovery_is_still_a_recovery(self):
+        # So can a recovery follow a recovery: sets of short reps are split by a
+        # longer rest, walked slower than the recoveries inside the set.
+        efforts = [9, 14, 7, 14, 7, 4, 14, 7, 14, 7, 9]
+        self.assertEqual(ai.label_blocks(efforts), [WU, W, R, W, R, R, W, R, W, R, CD])
+
+    def test_a_cool_down_jogged_faster_than_walked_recoveries_is_still_a_cool_down(self):
+        # Clearly harder than the block before it, and still not work: it sits
+        # with the warm-up, nowhere near the reps.
+        efforts = [10, 15, 5, 15, 5, 15, 5, 10]
+        self.assertEqual(ai.label_blocks(efforts)[-1], CD)
+
+    def test_a_rep_a_little_slower_than_the_one_before_it_is_still_work(self):
+        # Fading on the last reps is not recovering. Only a step of a fifth of
+        # the session's whole range counts as a change of effort.
+        efforts = [9, 14, 13, 7, 14, 7, 9]
+        self.assertEqual(ai.label_blocks(efforts), [WU, W, W, R, W, R, CD])
+
+    def test_a_session_without_warm_up_or_cool_down_is_all_reps_and_recoveries(self):
+        self.assertEqual(ai.label_blocks([15, 5, 15, 5, 15]), [W, R, W, R, W])
+
+    def test_blocks_that_barely_differ_are_left_unlabelled(self):
+        # Any split of a steady run into "work" and "recovery" would be noise.
+        self.assertIsNone(ai.label_blocks([6.5, 6.4, 6.6]))
+
+
+class PaceBeforeHeartRateTest(unittest.TestCase):
+    """The strides session: pace separates what a lagging heart rate cannot.
+
+    One-minute strides with two-minute recoveries are shorter than the time heart
+    rate takes to follow effort, so a stride's mean heart rate comes out below
+    the recovery after it. Comparing blocks by heart rate called every recovery a
+    rep and missed the tempo block altogether.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="intervals-pace-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        session_db(self.tmp / "t.duckdb")
+        self.con = duckdb.connect(str(self.tmp / "t.duckdb"))
+        self.addCleanup(self.con.close)
+        points = self.con.execute(
+            "SELECT t, lat, lon, ele, speed_ms FROM route_points ORDER BY t"
+        ).fetchall()
+        self.times = [p[0] for p in points]
+        self.cum, _speeds = ai.build_distance(points)
+        self.hr = self.con.execute("SELECT t, bpm FROM hr ORDER BY t").fetchall()
+
+    def test_every_block_is_labelled_by_pace(self):
+        blocks, signal = ai.blocks_from_structure(self.con, 1, self.hr, self.times, self.cum)
+        self.assertEqual(signal, "pace")
+        self.assertEqual([kind for kind, _a, _b in blocks], [kind for kind, *_ in STRIDES])
+
+    def test_without_a_route_heart_rate_is_used_and_the_report_says_so(self):
+        out = io.StringIO()
+        _blocks, how = ai.find_reps(self.con, 1, [], [], [], None, out, hr_by_t=self.hr)
+        self.assertEqual(how, "structure")
+        self.assertIn("told apart by heart rate", out.getvalue())
 
 
 class WindowStatsTest(unittest.TestCase):
@@ -338,6 +428,20 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_cli("--expect-reps", "5")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("(anchor max 172)", result.stdout)
+
+    def test_the_strides_session_counts_the_tempo_block_and_four_strides_as_work(self):
+        session_db(self.db)
+        result = self.run_cli("--max-hr", "190", "--expect-reps", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5 work bouts, 24:00 total (20:00, 1:00, 1:00, 1:00, 1:00)", result.stdout)
+        self.assertIn("warm-up", result.stdout)
+        self.assertIn("cool-down", result.stdout)
+        self.assertNotIn("NOTE", result.stdout)
+
+    def test_a_plan_that_disagrees_with_expect_reps_is_flagged(self):
+        session_db(self.db)
+        result = self.run_cli("--max-hr", "190", "--expect-reps", "4")
+        self.assertIn("NOTE: expected 4 reps", result.stdout)
 
     def test_a_strap_profile_without_strap_samples_still_refuses_to_guess(self):
         session_db(self.db, sensor="watch")

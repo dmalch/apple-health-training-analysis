@@ -181,12 +181,35 @@ shreds the reps. Prefer `workout_activities` → HR-derived → speed-derived, i
 order.
 
 Ordinary unstructured workouts have a single `is_primary_activity = 1` row, which is
-how to tell the two apart. The converter exposes all of it as `workout_blocks`.
+how to tell the two apart. The converter exposes all of it as `workout_blocks`, where
+`seq` counts the primary and the non-primary rows separately — both start at 1, so
+order by it only with `NOT is_primary` in the filter.
 
-Which blocks are the work is decided by heart rate: a work bout runs hotter than the
-blocks on *either side* of it. A threshold on the session mean looks simpler and
-breaks — heart rate drifts up as a session goes, so the last recoveries end up above
-the mean while the warm-up sits below it.
+**No row says which kind of step it is.** A warm-up, a work step, a recovery and a
+cool-down look alike. The workout's `_HKPrivateWorkoutConfiguration` metadata key is
+the one place the plan might be spelled out, but its value is a binary payload
+(value_type 4) that the converter drops as NULL; nobody has decoded it yet. So the
+kind is inferred, and heart rate is the wrong thing to infer it from on short blocks:
+it trails effort by 30–60 s. On one-minute strides with two-minute recoveries the
+strides averaged within 4 bpm of the recoveries, and below them twice in four. On
+40 s / 20 s sets, calling a block work when it ran hotter than both neighbours labelled
+every 20-second recovery as the rep. Pace has no lag and split both sessions cleanly,
+every rep at least 30% faster than its recovery. `analyze_intervals.py` labels by pace
+when the route covers every block, and by heart rate only when it does not; that still
+works on 4-minute reps.
+
+Two rules that look right fail on real plans. *Work is harder than both neighbours*
+drops a tempo block followed by strides that outrun it. *Work and recovery alternate*
+breaks on a set rest after the last rep's recovery. What holds is hysteresis: a block
+keeps the kind of the block before it unless its effort moves clearly — a fifth of the
+session's spread — the other way. The last block is judged by the blocks it is nearest
+to, because a cool-down jogged after walked recoveries is clearly harder than the block
+before it and still nothing like the reps. A threshold on the session mean breaks too:
+heart rate drifts up as a session goes, so the last recoveries end up above the mean
+while the warm-up sits below it.
+
+The labels describe what was run, not what was planned. A set rest run at rep pace is
+labelled work, because it was.
 
 Reading real boundaries changes numbers. One session's reps turned out to be exactly
 4:00 each rather than the 3:50–3:58 the speed detector inferred. **Anything compared

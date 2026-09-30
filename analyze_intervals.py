@@ -18,8 +18,8 @@ Two things it reports that nothing else here does:
    session shows up as a coverage gap, not as missing data.
 
 2. **Per-rep pace and heart rate**, from the GPS route where one exists. Reps
-   come from the watch's own lap markers when it recorded any, and are otherwise
-   detected from smoothed speed.
+   come from the watch's own plan when the session was a custom workout, then
+   from its lap markers, and are otherwise detected from smoothed speed.
 
 Needs the duckdb module (see .venv). Everything else is stdlib.
 """
@@ -258,54 +258,137 @@ def build_distance(points):
     return cum, speeds
 
 
-def work_blocks_from_structure(con, workout_id, hr_by_t):
-    """Work bouts from the blocks a structured workout was actually built from.
+# A change of effort between two blocks counts only when it is at least this
+# fraction of the session's whole spread, from its easiest block to its hardest.
+EFFORT_STEP = 0.2
+# Blocks whose efforts all lie within 10% of each other are one effort; any split
+# of them into work and recovery would be noise.
+MIN_EFFORT_SPREAD = 1.10
 
-    `workout_blocks` carries the watch's own plan -- warm-up, work, recovery,
-    cool-down -- so the boundaries are exact rather than inferred, and a bout
-    that was stopped early keeps its real length instead of the nominal one.
 
-    Which blocks are the work still has to be decided, and the rule is that a
-    work bout runs hotter than the blocks on either side of it. A threshold on
-    the session mean does not survive a long session: heart rate drifts up as it
-    goes, and the last recoveries end up above the mean while the warm-up sits
-    below it.
+def label_blocks(efforts):
+    """warmup / work / recovery / cooldown for each block, from its effort alone.
+
+    `efforts` holds one figure per block, higher meaning harder -- speed or mean
+    heart rate, the unit does not matter. None when the blocks barely differ.
+
+    Apple's plan is a warm-up, then work and recovery steps, then a cool-down,
+    and `workout_blocks` keeps the steps but not which kind each one was. Work
+    can follow work (a tempo block, then strides that outrun it) and recovery
+    can follow recovery (a set rest after the last rep's recovery), so neither
+    "hotter than both neighbours" nor strict alternation holds. What does is
+    hysteresis: a block keeps the kind of the block before it unless its effort
+    moves clearly, by EFFORT_STEP of the session's spread, the other way.
+
+    The first block is a warm-up when it is clearly easier than the one after
+    it. The last is judged by the company it keeps rather than by the step into
+    it: a cool-down jogged after walked recoveries is clearly harder than the
+    block before it, and still nothing like the reps.
+    """
+    hi, lo = max(efforts), min(efforts)
+    if hi <= lo * MIN_EFFORT_SPREAD:
+        return None
+    step = EFFORT_STEP * (hi - lo)
+
+    def easier(a, b):
+        return a < b - step
+
+    kinds = ["warmup" if easier(efforts[0], efforts[1]) else "work"]
+    for before, here in zip(efforts[:-2], efforts[1:-1], strict=True):
+        if kinds[-1] == "work":
+            kinds.append("recovery" if easier(here, before) else "work")
+        else:
+            kinds.append("work" if easier(before, here) else "recovery")
+
+    last, before = efforts[-1], efforts[-2]
+    if kinds[-1] == "work":
+        kinds.append("cooldown" if easier(last, before) else "work")
+    else:
+
+        def distance(of_kind):
+            return min(
+                (abs(last - e) for e, k in zip(efforts[:-1], kinds, strict=True) if k in of_kind),
+                default=math.inf,
+            )
+
+        nearer_work = distance({"work"}) < distance({"warmup", "recovery"})
+        kinds.append("work" if nearer_work else "cooldown")
+    return kinds
+
+
+def block_speed(start, end, times, cum):
+    """Metres per second over the route points inside one block, or None."""
+    lo = bisect.bisect_left(times, start)
+    hi = bisect.bisect_right(times, end) - 1
+    if hi <= lo or times[hi] <= times[lo]:
+        return None
+    return (cum[hi] - cum[lo]) / (times[hi] - times[lo]).total_seconds()
+
+
+def block_hr(start, end, stamps, hr_by_t):
+    """Mean heart rate over the samples inside one block, or None."""
+    lo = bisect.bisect_left(stamps, start)
+    hi = bisect.bisect_right(stamps, end)
+    return mean_or_none([bpm for _, bpm in hr_by_t[lo:hi]])
+
+
+def block_efforts(rows, hr_by_t, times, cum):
+    """One effort figure per block and what it measures, or (None, None).
+
+    Pace when the route covers every block, heart rate otherwise. Heart rate
+    trails effort by 30-60 s, so a one-minute stride's mean still reads mostly
+    the recovery before it, and comes out below the recovery after it; pace has
+    no such lag. The two cannot be mixed, so one block without a figure drops
+    that signal for the whole session.
+    """
+    if cum:
+        speeds = [block_speed(start, end, times, cum) for start, end in rows]
+        if all(s is not None for s in speeds):
+            return speeds, "pace"
+    stamps = [t for t, _ in hr_by_t]
+    means = [block_hr(start, end, stamps, hr_by_t) for start, end in rows]
+    if all(m is not None for m in means):
+        return means, "heart rate"
+    return None, None
+
+
+def blocks_from_structure(con, workout_id, hr_by_t, times=(), cum=()):
+    """The blocks a structured workout was actually built from, each labelled.
+
+    `workout_blocks` carries the watch's own plan, so the boundaries are exact
+    rather than inferred, and a bout that was stopped early keeps its real
+    length instead of the nominal one. Which block was which kind is not
+    recorded, and label_blocks decides it.
+
+    Returns ([(kind, start, end), ...], "pace" | "heart rate"), or ([], None)
+    when there is no plan or nothing to tell its blocks apart by.
     """
     if not con.execute(
         "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'workout_blocks'"
     ).fetchone()[0]:
-        return []  # an XML-derived database has no such table
+        return [], None  # an XML-derived database has no such table
+    # `seq` counts the primary and the non-primary rows separately, so both
+    # start at 1; ordering is only sound with the primary row filtered out.
     rows = con.execute(
         "SELECT start_date, end_date FROM workout_blocks"
         " WHERE workout_id = ? AND NOT is_primary ORDER BY seq",
         [workout_id],
     ).fetchall()
-    if len(rows) < 3 or not hr_by_t:
-        return []
+    if len(rows) < 3:
+        return [], None
 
-    stamps = [t for t, _ in hr_by_t]
-    means = []
-    for start, end in rows:
-        lo = bisect.bisect_left(stamps, start)
-        hi = bisect.bisect_right(stamps, end)
-        window = [bpm for _, bpm in hr_by_t[lo:hi]]
-        means.append(statistics.mean(window) if window else None)
-
-    bounds = []
-    for i, (start, end) in enumerate(rows):
-        here = means[i]
-        if here is None:
-            continue
-        neighbours = [
-            means[j] for j in (i - 1, i + 1) if 0 <= j < len(rows) and means[j] is not None
-        ]
-        if neighbours and all(here > other for other in neighbours):
-            bounds.append((start, end))
-    return bounds
+    efforts, signal = block_efforts(rows, hr_by_t, times, cum)
+    kinds = label_blocks(efforts) if efforts else None
+    if not kinds:
+        return [], None
+    return [(kind, a, b) for kind, (a, b) in zip(kinds, rows, strict=True)], signal
 
 
-def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=None):
+def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=None, cum=None):
     """The watch's own structure first, then lap markers, then thresholded speed.
+
+    Returns ([(kind, start, end), ...], how). Only the structure knows about
+    warm-up, recovery and cool-down; the other two yield work bouts alone.
 
     The order matters. `workout_blocks` is the plan the session was actually run
     to, so it beats anything inferred; markers come next when they are real laps;
@@ -313,13 +396,26 @@ def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=Non
     RunningSpeed stream carries spikes pinned at exactly 20.0 km/h, which drag
     the "fastest sustained pace" anchor far past anything that was run.
     """
-    structured = work_blocks_from_structure(con, workout_id, hr_by_t or [])
+    structured, signal = blocks_from_structure(con, workout_id, hr_by_t or [], times, cum or [])
     if structured:
+        n_work = sum(kind == "work" for kind, _a, _b in structured)
         print(
-            f"\nUsing the watch's own workout structure: {len(structured)} work "
-            f"blocks out of the session's plan.",
+            f"\nUsing the watch's own workout structure: {len(structured)} blocks, "
+            f"{n_work} of them work, told apart by {signal}.",
             file=out,
         )
+        if signal == "heart rate":
+            print(
+                "  Heart rate lags effort by 30-60 s: trust these labels on long "
+                "blocks, check them on short ones.",
+                file=out,
+            )
+        if expected and n_work != expected:
+            print(
+                f"  NOTE: expected {expected} reps, and the plan has {n_work} work "
+                f"blocks. Check the labels below before trusting the numbers.",
+                file=out,
+            )
         return structured, "structure"
 
     laps = con.execute(
@@ -353,7 +449,7 @@ def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=Non
         # and say nothing about the workout's structure -- ignore them.
         if session and covered / session < 0.95:
             print(f"\nUsing the watch's own markers: {len(bounds)} blocks.", file=out)
-            return bounds, "markers"
+            return [("work", a, b) for a, b in bounds], "markers"
         print(
             f"\n  markers cover {100 * covered / session:.0f}% of the session end to end "
             f"-> automatic segmentation, not laps. Ignoring them.",
@@ -382,7 +478,7 @@ def find_reps(con, workout_id, points, times, speeds, expected, out, hr_by_t=Non
         longest = sorted(runs, key=lambda r: -(times[r[1]] - times[r[0]]).total_seconds())
         runs = sorted(longest[:expected], key=lambda r: r[0])
         print(f"  keeping the {expected} longest of {len(longest)} candidate bouts", file=out)
-    return [(times[a], times[b]) for a, b in runs], "speed"
+    return [("work", times[a], times[b]) for a, b in runs], "speed"
 
 
 def window_stats(t0, t1, times, cum, hr_by_t, above=None):
@@ -414,14 +510,18 @@ def window_stats(t0, t1, times, cum, hr_by_t, above=None):
     }
 
 
-def report_blocks(bounds, times, cum, hr_by_t, max_hr, out):
-    """Interleave the work bouts with the recoveries that fall between them."""
+def report_blocks(blocks, times, cum, hr_by_t, max_hr, out):
+    """One row per block, with a recovery wherever the blocks leave a gap.
+
+    A structured workout's blocks tile the session, so nothing is inserted;
+    bouts found from markers or speed get the recoveries between them.
+    """
     ordered = []
     prev_end = None
-    for a, b in bounds:
+    for kind, a, b in blocks:
         if prev_end is not None and (a - prev_end).total_seconds() > 20:
             ordered.append(("recovery", prev_end, a))
-        ordered.append(("WORK", a, b))
+        ordered.append((kind, a, b))
         prev_end = b
 
     def cell(value, spec="", dash="-"):
@@ -439,12 +539,14 @@ def report_blocks(bounds, times, cum, hr_by_t, max_hr, out):
     n_work = n_rest = 0
     for kind, a, b in ordered:
         st = window_stats(a, b, times, cum, hr_by_t, above=0.90 * max_hr)
-        if kind == "WORK":
+        if kind == "work":
             n_work += 1
             label = f"rep {n_work}"
-        else:
+        elif kind == "recovery":
             n_rest += 1
             label = f"rest {n_rest}"
+        else:
+            label = {"warmup": "warm-up", "cooldown": "cool-down"}[kind]
         pct = 100 * st["avg_hr"] / max_hr if st["avg_hr"] else None
         print(
             f"{len(rows) + 1:>2} {label:<9} {a.strftime('%H:%M:%S'):>8} "
@@ -460,7 +562,7 @@ def report_blocks(bounds, times, cum, hr_by_t, max_hr, out):
         )
         rows.append((kind, label, a, b, st))
 
-    work = [r for r in rows if r[0] == "WORK"]
+    work = [r for r in rows if r[0] == "work"]
     rest = [r for r in rows if r[0] == "recovery"]
     if work:
         print("\n## Reps at a glance", file=out)
@@ -660,11 +762,11 @@ def main():
             times = [t for t, _ in hr_by_t]
             cum = []
 
-        bounds, _how = find_reps(
-            con, wid, points, times, speeds, args.expect_reps, out, hr_by_t=hr_by_t
+        blocks, _how = find_reps(
+            con, wid, points, times, speeds, args.expect_reps, out, hr_by_t=hr_by_t, cum=cum
         )
-        if bounds:
-            report_blocks(bounds, times, cum, hr_by_t, max_hr, out)
+        if blocks:
+            report_blocks(blocks, times, cum, hr_by_t, max_hr, out)
         else:
             print("\nCould not resolve discrete blocks.", file=out)
 

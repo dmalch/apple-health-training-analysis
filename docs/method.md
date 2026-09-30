@@ -122,8 +122,14 @@ A session that alternates hard and easy has a meaningless average, so this repor
 rep: pace, average and peak HR, HR entering and leaving the rep, and how much of the
 rep was spent above 90% of max. Recoveries get their HR drop.
 
-Rep detection tries three sources in order — structured `workout_blocks`, then heart
-rate, then GPS speed. Two things it deliberately does not trust:
+Rep detection tries three sources in order — structured `workout_blocks`, then the
+watch's lap markers, then GPS speed. The structure carries exact boundaries but not
+which block is work; that is read from pace, not heart rate, whenever the route covers
+the session (see [apple-health.md](apple-health.md#structured-workout-blocks-workout_activities--workout_blocks)
+for the measurement). The report says which it used, and `--expect-reps` flags a plan
+whose work-block count differs from the one you meant to run.
+
+Things it deliberately does not trust:
 
 - **Apple's `Segment` events are not laps.** One session had 13 of them tiling the
   entire 47 minutes end to end with no gaps: automatic segmentation with nothing to do
