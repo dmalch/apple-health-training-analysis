@@ -34,7 +34,7 @@ from datetime import timedelta
 import duckdb
 
 import athlete_profile
-from analyze import MAX_SAMPLE_GAP_S
+from analyze import MAX_SAMPLE_GAP_S, resolve_max_hr
 
 EARTH_R = 6371008.8
 
@@ -547,13 +547,6 @@ def main():
     args = ap.parse_args()
 
     profile = athlete_profile.from_args(args, required=False)
-    max_hr = args.max_hr or athlete_profile.field(profile, "max_hr")
-    if not max_hr:
-        raise SystemExit(
-            "no max-HR anchor. Pass --max-hr, or --profile NAME for a profile that "
-            "sets one. Every percentage in this report is cut from that number, so "
-            "guessing it would misreport every rep."
-        )
     db = args.db or athlete_profile.field(profile, "db")
     if not db:
         raise SystemExit("no database. Pass --db PATH or --profile NAME.")
@@ -561,6 +554,23 @@ def main():
 
     con = duckdb.connect(db, read_only=True)
     con.execute("SET TimeZone=?", [tz])
+
+    # Same order as analyze.py, including a profile's "strap", so one profile
+    # never means two anchors.
+    max_hr, _note = resolve_max_hr(args.max_hr, profile, con)
+    if not max_hr:
+        # With a profile loaded, the only way to get here is max_hr = "strap".
+        why = (
+            'The profile says "strap", and the database has no strap reading '
+            "sustained for 10 s inside a workout. "
+            if profile
+            else ""
+        )
+        raise SystemExit(
+            f"no max-HR anchor. {why}Pass --max-hr, or --profile NAME for a profile "
+            "that sets one. Every percentage in this report is cut from that number, "
+            "so guessing it would misreport every rep."
+        )
 
     date = args.date
     if not date and not args.workout:

@@ -173,6 +173,30 @@ def strap_anchor(con):
     return row[0] if row else None
 
 
+STRAP_ANCHOR_NOTE = (
+    "highest chest-strap reading sustained for 10 s inside a workout — "
+    "optical wrist peaks and strap artifacts on removal both run higher "
+    "and are not trustworthy"
+)
+
+
+def resolve_max_hr(flag, profile, con=None):
+    """The max-HR anchor and where it came from, or (None, None).
+
+    Explicit flag, then the profile's own figure, then -- for a profile that
+    says `max_hr = "strap"`, which loads as None -- the strap stream in `con`.
+    Every script that cuts zones goes through here, so a profile means the same
+    anchor whichever of them reads it.
+    """
+    if flag:
+        return flag, "supplied"
+    if profile and profile["max_hr"]:
+        return profile["max_hr"], "from the profile"
+    if profile and con is not None:
+        return strap_anchor(con), STRAP_ANCHOR_NOTE
+    return None, None
+
+
 def load_db(db_path, cross_talk=frozenset(), tz="UTC"):
     """Same shapes `load()` returns, read from DuckDB instead of the CSVs."""
     con = open_db(db_path, tz)
@@ -1261,17 +1285,8 @@ def main():
     workouts.sort(key=lambda w: w["start"])
 
     # The anchor has to be settled before zones can be cut, so it is resolved
-    # here rather than inside intensity(): explicit flag, then the profile's
-    # own figure, then the strap.
-    hr_max = args.max_hr or profile["max_hr"]
-    anchor_note = "supplied" if args.max_hr else "from the profile"
-    if not hr_max and con is not None:
-        hr_max = strap_anchor(con)
-        anchor_note = (
-            "highest chest-strap reading sustained for 10 s inside a workout — "
-            "optical wrist peaks and strap artifacts on removal both run higher "
-            "and are not trustworthy"
-        )
+    # here rather than inside intensity().
+    hr_max, anchor_note = resolve_max_hr(args.max_hr, profile, con)
 
     zone_note = ""
     if con is not None and hr_max:

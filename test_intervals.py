@@ -12,16 +12,24 @@ watch's automatic Segment markers said nothing. The blocks were in
 Needs duckdb (see .venv); no real health data.
 """
 
+import csv
 import datetime
 import io
+import math
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
+from pathlib import Path
 
 import duckdb
 
 import analyze_intervals as ai
+
+REPO = Path(__file__).resolve().parent
 
 BASE = datetime.datetime(2026, 9, 3, 9, 35, 51, tzinfo=datetime.UTC)
 
@@ -128,10 +136,6 @@ class StructuredBlockTest(unittest.TestCase):
         self.assertEqual(ai.work_blocks_from_structure(self.con, 1, []), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class WindowStatsTest(unittest.TestCase):
     """window_stats must survive a block whose heart-rate stream has holes.
 
@@ -173,3 +177,175 @@ class WindowStatsTest(unittest.TestCase):
         st = ai.window_stats(t0, t1, [], [], self.stream(range(0, 245, 5)))
         self.assertAlmostEqual(st["start_hr"], 150.0)
         self.assertAlmostEqual(st["end_hr"], 150.0)
+
+
+# A second synthetic session, shaped like the one that exposed the faults the
+# command-line tests below pin: a warm-up, a 20-minute tempo block, four
+# one-minute strides with two-minute recoveries, and a cool-down.
+# (kind, seconds, speed in m/s, the heart rate the block settles at)
+STRIDES_BASE = datetime.datetime(2030, 5, 4, 8, 0, 0, tzinfo=datetime.UTC)
+STRIDES = [
+    ("warmup", 900, 2.2, 130),
+    ("work", 1200, 2.6, 155),
+    *[("work", 60, 3.1, 172), ("recovery", 120, 2.0, 150)] * 4,
+    ("cooldown", 390, 2.2, 140),
+]
+# Heart rate trails effort. Modelled as a plain delay: each sample reads what the
+# block LAG_S seconds earlier asked for, so a one-minute stride spends three
+# quarters of itself still showing the recovery before it.
+LAG_S = 45
+# One sample far above anything sustained, the way a strap artifact reads.
+SPIKE_S, SPIKE_BPM = 300, 199
+
+
+def bulk_insert(con, table, rows, beside):
+    """Load rows through a CSV: executemany takes seconds over a session's worth."""
+    staging = f"{beside}.{table}.csv"
+    with open(staging, "w", newline="") as fh:
+        csv.writer(fh).writerows(
+            [v.isoformat() if isinstance(v, datetime.datetime) else v for v in row] for row in rows
+        )
+    con.execute(f"COPY {table} FROM '{staging}' (HEADER false)")
+    os.remove(staging)
+
+
+def session_db(path, plan=STRIDES, base=STRIDES_BASE, sensor="strap"):
+    """Write a one-workout database with the tables analyze_intervals.py reads."""
+
+    def at_(s):
+        return base + datetime.timedelta(seconds=s)
+
+    edges = [0]
+    for _, secs, _, _ in plan:
+        edges.append(edges[-1] + secs)
+    end = edges[-1]
+
+    def block_at(s):
+        for i, (lo, hi) in enumerate(zip(edges, edges[1:], strict=False)):
+            if lo <= s < hi:
+                return plan[i]
+        return plan[-1]
+
+    con = duckdb.connect(str(path))
+    con.execute(
+        "CREATE TABLE workouts ("
+        " id BIGINT, local_date DATE, start_date TIMESTAMPTZ, end_date TIMESTAMPTZ)"
+    )
+    con.execute("INSERT INTO workouts VALUES (1, ?, ?, ?)", [base.date(), at_(0), at_(end)])
+
+    # Straight east along a parallel, one fix a second at the block's speed.
+    lat, lon = 10.0, 20.0
+    route = []
+    dist = 0.0
+    for s in range(end + 1):
+        speed = block_at(s)[2]
+        route.append(("r1", at_(s), lat, lon, 0.0, speed))
+        lon += math.degrees(speed / (ai.EARTH_R * math.cos(math.radians(lat))))
+        dist += speed
+    con.execute(
+        "CREATE TABLE route_points ("
+        " route_file VARCHAR, t TIMESTAMPTZ, lat DOUBLE, lon DOUBLE, ele DOUBLE, speed_ms DOUBLE)"
+    )
+    bulk_insert(con, "route_points", route, path)
+
+    hr = []
+    for s in range(end + 1):
+        bpm = SPIKE_BPM if s == SPIKE_S else (block_at(s - LAG_S)[3] if s >= LAG_S else 110)
+        hr.append((at_(s), float(bpm), sensor, "Test strap", "Test source"))
+    con.execute(
+        "CREATE TABLE hr ("
+        " t TIMESTAMPTZ, bpm DOUBLE, sensor VARCHAR, device_name VARCHAR, source_name VARCHAR)"
+    )
+    bulk_insert(con, "hr", hr, path)
+
+    con.execute("""
+        CREATE TABLE workout_summary (
+            id BIGINT, local_date DATE, local_time TIME, activity VARCHAR,
+            duration_min DOUBLE, distance_km DOUBLE, avg_hr DOUBLE, max_hr DOUBLE,
+            min_hr DOUBLE, active_kcal DOUBLE, indoor BOOLEAN, route_file VARCHAR,
+            start_date TIMESTAMPTZ, end_date TIMESTAMPTZ,
+            source_name VARCHAR, device_name VARCHAR)""")
+    con.execute(
+        "INSERT INTO workout_summary VALUES"
+        " (1, ?, ?, 'Running', ?, ?, NULL, NULL, NULL, NULL, false, 'r1', ?, ?, 'Watch', 'Watch')",
+        [base.date(), base.time(), end / 60, dist / 1000, at_(0), at_(end)],
+    )
+
+    con.execute("""
+        CREATE TABLE workout_events (
+            workout_id BIGINT, type VARCHAR, date TIMESTAMPTZ, duration_min DOUBLE)""")
+
+    # Laid out the way the converter writes it: `seq` counts within the primary
+    # and the non-primary rows separately, so both sets start at 1.
+    con.execute("""
+        CREATE TABLE workout_blocks (
+            workout_id BIGINT, seq BIGINT, is_primary BOOLEAN,
+            start_date TIMESTAMPTZ, end_date TIMESTAMPTZ, duration_min DOUBLE)""")
+    con.execute(
+        "INSERT INTO workout_blocks VALUES (1, 1, true, ?, ?, ?)", [at_(0), at_(end), end / 60]
+    )
+    for i, (lo, hi) in enumerate(zip(edges, edges[1:], strict=False), 1):
+        con.execute(
+            "INSERT INTO workout_blocks VALUES (1, ?, false, ?, ?, ?)",
+            [i, at_(lo), at_(hi), (hi - lo) / 60],
+        )
+    con.close()
+
+
+class CommandLineTest(unittest.TestCase):
+    """The script end to end, run the way it is run by hand."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="intervals-cli-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.db = self.tmp / "t.duckdb"
+        self.profile = self.tmp / "athlete.toml"
+        self.profile.write_text(
+            textwrap.dedent(f"""
+                timezone = "UTC"
+                max_hr = "strap"
+                strength = []
+                hybrid = []
+                db = "{self.db}"
+            """)
+        )
+
+    def run_cli(self, *args):
+        env = {k: v for k, v in os.environ.items() if k != "HEALTH_PROFILE"}
+        return subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "analyze_intervals.py"),
+                "--profile-file",
+                str(self.profile),
+                "--workout",
+                "1",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=REPO,
+            timeout=120,
+        )
+
+    def test_a_strap_profile_takes_its_anchor_from_the_strap(self):
+        # max_hr = "strap" is a valid profile, and analyze.py derives the anchor
+        # from it. This script used to read the None it loads as and refuse. The
+        # anchor is the strides' 172, held for a minute in all -- not the
+        # one-sample 199, which a plain max() would take.
+        session_db(self.db)
+        result = self.run_cli("--expect-reps", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(anchor max 172)", result.stdout)
+
+    def test_a_strap_profile_without_strap_samples_still_refuses_to_guess(self):
+        session_db(self.db, sensor="watch")
+        result = self.run_cli()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--max-hr", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
