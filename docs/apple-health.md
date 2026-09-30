@@ -277,6 +277,13 @@ across sessions has to come from the same method.**
   scale was within 2%, and there was **no** case where the XML had a heart rate and
   the backup database did not — while the backup route filled in average HR for
   hundreds of workouts where the XML has none.
+- **Matching counts are not matching values.** A `samples` row with no
+  `quantity_samples` row comes through with its timestamp and a NULL `value`. One live
+  database carried 4,857 HeartRate samples like that, watch and AirPods, all on the
+  workout days of one ten-day stretch — and the XML export has a value for every one of
+  them. `--verify` compares per-day counts, so it passed. Why the quantity is missing
+  is not traced yet. Anything reading `hr` has to drop `bpm IS NULL` before measuring
+  gaps or coverage; `analyze.py` does.
 
 ## Parsing the XML
 

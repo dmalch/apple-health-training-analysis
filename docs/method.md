@@ -92,6 +92,14 @@ keeps the average-based treatment. Typically fewer than half of aerobic sessions
 qualify — the rest are activities the watch barely samples, like an elliptical at 19
 samples per 27 minutes.
 
+Only samples with a value count, for coverage as well as for zones. The backup route
+can carry a sample's timestamp without its value, and counting those let a session
+built almost entirely from them pass the 60% check with no time in any zone — which
+the session count then filed under Z1, because every zone tied at zero. Samples that
+share a timestamp are ordered by value, so the seconds until the next sample go to
+the same one on every run; ordered by time alone, that was the database's choice,
+and the same database gave three different reports in twenty runs.
+
 **What changes when you switch.** On sessions that have both, the easy/hard headline
 barely moves, but the *shape* does: Z1 up about 12 points, Z2 down 11, Z3 down 7, Z4 up
 5. The average-based method inflates the middle at the expense of both ends. The real

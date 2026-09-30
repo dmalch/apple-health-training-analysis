@@ -34,7 +34,9 @@ Reports must be reproducible. Two checks, both cheap:
 
 - Run `analyze.py` twice against the same database and diff. Identical output is the
   contract — a set iterated into a table once broke it, and the same export produced
-  a different report on every run.
+  a different report on every run. So did a SQL window ordered by timestamp alone,
+  where two samples shared one — and that failure is intermittent: three runs in a
+  row agreed after the first mismatch. After touching SQL, run it twenty times.
 - Run the old and new code against the same database and diff. Any change in the
   numbers has to be explained, not discovered later.
 

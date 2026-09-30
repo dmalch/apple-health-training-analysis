@@ -126,6 +126,16 @@ FOOT_ACTIVITIES = {
 # is short. Outside dense workout recording the stream is downsampled to one
 # sample per minute or worse, and letting those gaps count would invent hours of
 # zone time out of background sampling.
+#
+# "The next one" has to be the same sample on every run, or the same database
+# gives a different report each time. Two things broke that. The backup route
+# carries some samples with a timestamp and no value; left in, one took the
+# seconds from the real reading beside it and still counted as coverage, so a
+# session made mostly of them passed MIN_ZONE_COVERAGE with no time in any zone.
+# They are dropped before the gap is taken. And samples can share a timestamp,
+# so every window here orders by value after time -- ordered by time alone,
+# which of a tied pair took the gap was the database's choice, and one session's
+# dominant zone moved between Z1 and Z3 from run to run.
 MAX_SAMPLE_GAP_S = 15
 
 # Below this, the stream is too sparse to describe the session and the old
@@ -160,9 +170,10 @@ def strap_anchor(con):
     row = con.execute(f"""
         WITH s AS (
             SELECT h.bpm,
-                   epoch(lead(h.t) OVER (PARTITION BY w.id ORDER BY h.t) - h.t) AS d
+                   epoch(lead(h.t) OVER (PARTITION BY w.id ORDER BY h.t, h.bpm) - h.t) AS d
             FROM workouts w
             JOIN hr h ON h.t BETWEEN w.start_date AND w.end_date AND h.sensor = 'strap'
+                     AND h.bpm IS NOT NULL
         )
         SELECT max(bpm) FROM (
             SELECT bpm, sum(d) AS secs FROM s
@@ -276,10 +287,11 @@ def attach_zones(con, workouts, hr_max, cross_talk=frozenset()):
         CREATE OR REPLACE TEMP TABLE w_sensor AS
         WITH gaps AS (
             SELECT w.id, h.sensor,
-                   epoch(lead(h.t) OVER (PARTITION BY w.id, h.sensor ORDER BY h.t) - h.t) AS d
+                   epoch(lead(h.t) OVER (PARTITION BY w.id, h.sensor ORDER BY h.t, h.bpm)
+                         - h.t) AS d
             FROM workouts w
             JOIN hr h ON h.t BETWEEN w.start_date AND w.end_date
-            WHERE h.sensor IN ('strap', 'watch', 'airpods')
+            WHERE h.sensor IN ('strap', 'watch', 'airpods') AND h.bpm IS NOT NULL
         ),
         cov AS (
             SELECT id, sensor, sum(d) AS covered
@@ -298,11 +310,11 @@ def attach_zones(con, workouts, hr_max, cross_talk=frozenset()):
 {cases}
         FROM (
             SELECT w.id, h.bpm,
-                   epoch(lead(h.t) OVER (PARTITION BY w.id ORDER BY h.t) - h.t) AS d
+                   epoch(lead(h.t) OVER (PARTITION BY w.id ORDER BY h.t, h.bpm) - h.t) AS d
             FROM workouts w
             JOIN w_sensor s USING (id)
             JOIN hr h ON h.t BETWEEN w.start_date AND w.end_date
-                     AND h.sensor = s.use_sensor
+                     AND h.sensor = s.use_sensor AND h.bpm IS NOT NULL
         )
         WHERE d IS NOT NULL AND d <= {MAX_SAMPLE_GAP_S}
         GROUP BY id
