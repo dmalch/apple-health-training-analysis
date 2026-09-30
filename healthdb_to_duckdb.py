@@ -18,7 +18,9 @@ from. Same samples, plus per-sample provenance the XML flattens.
 
 The output tables and views are deliberately identical to health_to_duckdb.py
 (VIEWS is imported from it, not copied), so analyze.py, analyze_intervals.py
-and hq.py work against either database.
+and hq.py work against either database. What differs is what `records` holds
+where the phone packed heart rate into series: the XML has one row per series,
+this the readings, which the XML cannot recover (build_series_points).
 
 Needs the duckdb module (see .venv); the sqlite side is stdlib. Reading an
 encrypted backup additionally needs `pip install iOSbackup`.
@@ -243,6 +245,15 @@ OTHER_TYPES = {
 
 # `objects.type` of a deleted sample. See build().
 DELETED_OBJECT = 2
+
+# Quantity series read as their readings rather than as one row; see
+# build_series_points(). Heart rate only, because it is the one type anything
+# here reads sample by sample. Energy, distance and step series hold a sum, so
+# one row keeps every daily total exact. The other types that arrive as series --
+# audio exposure (7.3M points in one backup), running dynamics, cycling power --
+# have no per-sample reader, and expanding them all would more than double
+# `records`.
+SERIES_READ_AS_POINTS = (5,)  # HeartRate
 
 # healthdb_secure stores quantities in HealthKit's canonical SI units, while
 # export.xml carries the display units. Heart rate is the one that matters: the
@@ -609,6 +620,100 @@ def type_map_table(con_db):
         con_db.executemany(f"INSERT INTO {table} VALUES (?, ?)", sorted(mapping.items()))
 
 
+def build_series_points(con, cols):
+    """Stage the readings inside each quantity series, for build() to join in.
+
+    A workout's heart rate is packed into series 120 days on, and iOS 27 writes
+    some straight into series: one `samples` row each, whose own value is none of
+    its readings, and the points in `quantity_series_data`. Those are keyed by
+    `series_identifier` = `quantity_sample_series.hfd_key`, **not** the data_id --
+    the same trap as the routes.
+
+    The points are run-length encoded: consecutive identical readings become one
+    point whose `duration` runs from the first of them to the last. Against an XML
+    export taken before the phone packed them, every point with a duration had
+    absorbed at least two readings, the first at its timestamp and the last at
+    timestamp + duration, with a median 5 s between them. So a point comes back as
+    readings at both ends and evenly in between, spaced at its series' own cadence:
+    the median gap from one point's end to the next point's start, which is one
+    reading interval, because the next reading differed.
+
+    Creates `series_points` (id, t, value) -- id the series' data_id, t on the
+    HealthKit epoch, value in canonical units -- and returns whether there was
+    anything to read.
+    """
+    if any(name not in cols for name in ("quantity_sample_series", "quantity_series_data")):
+        return False
+    codes = ", ".join(str(c) for c in SERIES_READ_AS_POINTS)
+    con.execute(f"""
+        CREATE TEMP TABLE series_points AS
+        WITH points AS (
+            SELECT q.data_id AS id, d.timestamp AS t, d.duration AS dur, d.value,
+                   lead(d.timestamp) OVER (PARTITION BY q.data_id ORDER BY d.timestamp)
+                       - d.timestamp - d.duration AS gap
+            FROM hk.quantity_series_data d
+            JOIN hk.quantity_sample_series q ON q.hfd_key = d.series_identifier
+            JOIN hk.samples s ON s.data_id = q.data_id
+            WHERE s.data_type IN ({codes})
+        ),
+        cadence AS (
+            -- Nothing here reads faster than 1 Hz. A strap series can hold two
+            -- points a millisecond apart, and without the floor its cadence
+            -- would split a point into thousands of readings.
+            SELECT id, greatest(median(gap), 1.0) AS every
+            FROM points WHERE gap > 0 GROUP BY id
+        ),
+        runs AS (
+            SELECT p.id, p.t, p.dur, p.value,
+                   CASE WHEN p.dur > 0
+                        THEN greatest(1, CAST(round(p.dur / coalesce(c.every, p.dur)) AS BIGINT))
+                        ELSE 0 END AS n
+            FROM points p LEFT JOIN cadence c USING (id)
+        )
+        SELECT id, t + dur * i / greatest(n, 1) AS t, value
+        FROM (SELECT *, unnest(generate_series(0, n)) AS i FROM runs)
+    """)
+    return True
+
+
+def build_series_table(con):
+    """One row per series that `records` holds as its readings.
+
+    This is the row the phone stores and the XML export writes -- the series'
+    own value, which is not the mean of its readings -- so --verify can fold the
+    readings back and compare like with like. `points` is what the phone stored,
+    `readings` what came back out of them.
+    """
+    con.execute("""
+        CREATE TABLE quantity_series AS
+        SELECT r.id, r.type, r.source_name, r.device_name, r.start_date, r.end_date,
+               r.local_date, r.local_time,
+               CAST(qs.quantity AS DOUBLE) * coalesce(sc.factor, 1.0) AS value,
+               CAST(q."count" AS BIGINT)                             AS points,
+               r.readings
+        FROM (
+            SELECT id, any_value(type) AS type, any_value(source_name) AS source_name,
+                   any_value(device_name) AS device_name,
+                   min(start_date) AS start_date, max(end_date) AS end_date,
+                   arg_min(local_date, start_date) AS local_date,
+                   arg_min(local_time, start_date) AS local_time,
+                   count(*) AS readings
+            FROM records WHERE id IN (SELECT id FROM series_points)
+            GROUP BY id
+        ) r
+        JOIN hk.quantity_sample_series q ON q.data_id = r.id
+        JOIN hk.quantity_samples qs ON qs.data_id = r.id
+        LEFT JOIN hk_scale sc ON sc.name = r.type
+    """)
+    n, points, readings = con.execute(
+        "SELECT count(*), coalesce(sum(points), 0), coalesce(sum(readings), 0) FROM quantity_series"
+    ).fetchone()
+    print(
+        f"  quantity_series      {n:>12,} rows, {points:,} points read as {readings:,} readings",
+        file=sys.stderr,
+    )
+
+
 def build(db_path, out_db, tz_default):
     con_sq = sqlite_open(db_path)
     cols = table_columns(con_sq)
@@ -707,14 +812,27 @@ def build(db_path, out_db, tz_default):
     cat_val = "c.value" if has_category else "NULL"
 
     t0 = time.time()
+    # A series of a type in SERIES_READ_AS_POINTS arrives as one row per reading
+    # instead of its own row, whose value is none of the readings -- kept beside
+    # them, it would be one more reading at the first one's instant. Every
+    # reading carries the series' data_id, so the series' metadata (a heart-rate
+    # context, on 4,252 of 4,255 series) still reaches each of them, as it
+    # reached each sample before the phone packed them, and `id` is no longer
+    # unique in `records`.
+    start, end, points = "s.start_date", "s.end_date", ""
+    series = build_series_points(con, cols)
+    if series:
+        start, end = "coalesce(pt.t, s.start_date)", "coalesce(pt.t, s.end_date)"
+        qty_val = f"coalesce(pt.value, {qty_val})"
+        points = "LEFT JOIN series_points pt ON pt.id = s.data_id"
     con.execute(f"""
         CREATE TABLE records AS
         WITH raw AS (
             SELECT
                 s.data_id                                   AS id,
                 s.data_type                                 AS type_code,
-                to_timestamp(s.start_date + {APPLE_EPOCH_OFFSET})  AS start_date,
-                to_timestamp(s.end_date   + {APPLE_EPOCH_OFFSET})  AS end_date,
+                to_timestamp({start} + {APPLE_EPOCH_OFFSET}) AS start_date,
+                to_timestamp({end} + {APPLE_EPOCH_OFFSET})   AS end_date,
                 to_timestamp(o.creation_date + {APPLE_EPOCH_OFFSET}) AS creation_date,
                 CAST({qty_val} AS DOUBLE)                   AS value,
                 CAST({cat_val} AS VARCHAR)                  AS value_text,
@@ -730,6 +848,7 @@ def build(db_path, out_db, tz_default):
             {src_lookup}
             {qty}
             {cat}
+            {points}
             {live_filter}
         )
         SELECT
@@ -761,6 +880,8 @@ def build(db_path, out_db, tz_default):
         print(f"    deleted, skipped   {n:>12,} rows", file=sys.stderr)
     for name, n in valueless_records(con):
         print(f"  WARNING: {n:,} {name} records carry no value", file=sys.stderr)
+    if series:
+        build_series_table(con)
 
     build_workouts(con, cols, tz_default, dev_expr, dev_lookup, src_expr, src_lookup)
     build_blocks(con, con_sq, cols)
@@ -1289,6 +1410,11 @@ def stub_missing(con):
             route_file VARCHAR, t TIMESTAMPTZ, lat DOUBLE, lon DOUBLE, ele DOUBLE,
             speed_ms DOUBLE, course DOUBLE, hacc DOUBLE, vacc DOUBLE)""")
     con.execute(f"CREATE TABLE IF NOT EXISTS workout_blocks ({WORKOUT_BLOCKS_SCHEMA})")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS quantity_series (
+            id BIGINT, type VARCHAR, source_name VARCHAR, device_name VARCHAR,
+            start_date TIMESTAMPTZ, end_date TIMESTAMPTZ, local_date DATE, local_time TIME,
+            value DOUBLE, points BIGINT, readings BIGINT)""")
     con.execute("CREATE TABLE IF NOT EXISTS export_meta (key VARCHAR, value VARCHAR)")
     con.execute("INSERT INTO export_meta VALUES ('source', 'healthdb_secure.sqlite')")
 
@@ -1318,6 +1444,18 @@ def valueless_records(con):
 # on 1,596 days whose counts matched, that alone moved the mean by up to 1.24 bpm.
 MEAN_BPM_TOLERANCE = 1.5
 
+# `records` as the phone stores it: every series that came in as its readings
+# folded back into its one row. The XML export writes a series as one row too,
+# so this is the side --verify compares. Against the readings instead, 1,314
+# days differed where 799 had, and heart rate came out 13% off in the scale
+# check -- a unit bug by that check's own reading.
+STORED_RECORDS = """(
+    SELECT type, local_date, start_date, end_date, value FROM records
+    WHERE id NOT IN (SELECT id FROM quantity_series)
+    UNION ALL
+    SELECT type, local_date, start_date, end_date, value FROM quantity_series
+)"""
+
 
 def hr_day_diffs(con):
     """Days whose heart rate differs from the XML database's, most recent first.
@@ -1326,7 +1464,8 @@ def hr_day_diffs(con):
     count, in samples without a value, or in its mean -- counts alone once
     matched on days where thousands of samples had lost their values. Only days
     both databases cover completely are compared: the export's last day is
-    partial and everything after it is missing, not different.
+    partial and everything after it is missing, not different. Series count as
+    the one row each the phone stores (STORED_RECORDS).
 
     Rows: (day, live n, xml n, live n without a value, live mean, xml mean,
     live rows spanning time, xml rows spanning time). A spanning row is usually
@@ -1341,7 +1480,7 @@ def hr_day_diffs(con):
         per_day AS (
             SELECT local_date, count(*) AS n, count(*) FILTER (value IS NULL) AS no_value,
                    avg(value) AS bpm, count(*) FILTER (end_date > start_date) AS spans
-            FROM records WHERE type = 'HeartRate' GROUP BY 1
+            FROM {STORED_RECORDS} WHERE type = 'HeartRate' GROUP BY 1
         ),
         old_per_day AS (
             SELECT local_date, count(*) AS n, avg(value) AS bpm,
@@ -1361,6 +1500,76 @@ def hr_day_diffs(con):
     """).fetchall()
 
 
+def scale_diffs(con):
+    """(type, live rows, xml mean / live mean) for types more than 2% apart.
+
+    The check that catches silent unit bugs: HealthKit's canonical units are not
+    the XML's display units, so a type whose ratio is not 1.0 needs an entry in
+    UNIT_SCALE. Read from STORED_RECORDS, like the day-by-day comparison.
+    """
+    return con.execute(f"""
+        -- Only the window both databases cover: the XML export is a snapshot and
+        -- everything after it would otherwise read as a scale difference.
+        WITH cutoff AS (SELECT max(local_date) AS d FROM old.records)
+        SELECT a.type, a.n AS live_n, round(b.v / nullif(a.v, 0), 4) AS ratio
+        FROM (SELECT type, count(*) n, avg(value) v FROM {STORED_RECORDS}
+              WHERE value IS NOT NULL AND local_date < (SELECT d FROM cutoff)
+              GROUP BY 1) a
+        JOIN (SELECT type, count(*) n, avg(value) v FROM old.records
+              WHERE value IS NOT NULL AND local_date < (SELECT d FROM cutoff)
+              GROUP BY 1) b USING (type)
+        WHERE a.n > 20 AND abs(coalesce(b.v / nullif(a.v, 0), 1) - 1) > 0.02
+        ORDER BY a.n DESC LIMIT 20
+    """).fetchall()
+
+
+def series_reading_diffs(con):
+    """Series the XML database still holds as the phone's own readings.
+
+    An export taken before the phone packed a session keeps the readings the
+    series was packed from, and that is the only check there is on how
+    build_series_points() reads them back. A series qualifies when the XML has
+    no row spanning time over it from the same device. Both sides are then
+    counted over the series' span on that device, background readings
+    included, so they differ only by what the expansion got wrong. The span
+    gets a second of slack at each end, since the export writes whole seconds.
+
+    Rows: (series id, local date, n here, n in the XML, mean here, mean in the
+    XML), furthest apart in mean first.
+    """
+    return con.execute("""
+        WITH last AS (SELECT max(end_date) AS t FROM old.records WHERE type = 'HeartRate'),
+        unpacked AS (
+            SELECT s.* FROM quantity_series s, last
+            WHERE s.type = 'HeartRate' AND s.end_date < last.t
+              AND NOT EXISTS (
+                  SELECT 1 FROM old.records x
+                  WHERE x.type = 'HeartRate' AND x.device_name = s.device_name
+                    AND x.end_date > x.start_date
+                    AND x.start_date <= s.end_date AND x.end_date >= s.start_date)
+        ),
+        here AS (
+            SELECT s.id, count(r.value) AS n, avg(r.value) AS bpm
+            FROM unpacked s LEFT JOIN records r
+              ON r.type = 'HeartRate' AND r.device_name = s.device_name
+             AND r.start_date BETWEEN s.start_date - INTERVAL 1 SECOND
+                                  AND s.end_date + INTERVAL 1 SECOND
+            GROUP BY 1
+        ),
+        there AS (
+            SELECT s.id, count(x.value) AS n, avg(x.value) AS bpm
+            FROM unpacked s LEFT JOIN old.records x
+              ON x.type = 'HeartRate' AND x.device_name = s.device_name
+             AND x.start_date BETWEEN s.start_date - INTERVAL 1 SECOND
+                                  AND s.end_date + INTERVAL 1 SECOND
+            GROUP BY 1
+        )
+        SELECT s.id, s.local_date, h.n, t.n, h.bpm, t.bpm
+        FROM unpacked s JOIN here h USING (id) JOIN there t USING (id)
+        ORDER BY abs(h.bpm - t.bpm) DESC NULLS FIRST, s.id
+    """).fetchall()
+
+
 def verify(new_db, xml_db):
     """Compare against an XML-derived database over the days they share.
 
@@ -1377,7 +1586,10 @@ def verify(new_db, xml_db):
     for t, n in rows:
         print(f"  {t:<32} {n:>10,}")
 
-    print("\nday-by-day HeartRate, this DB vs XML DB, on the days both cover:")
+    print(
+        "\nday-by-day HeartRate, this DB vs XML DB, on the days both cover"
+        " (a series counts as its one row, as the XML stores it):"
+    )
     rows = hr_day_diffs(con)
 
     # Furthest apart first. Newest first, the days that differ trivially filled
@@ -1400,24 +1612,26 @@ def verify(new_db, xml_db):
             f"no value={no_value:>5,}  mean {mean}  spans {live_spans}/{xml_spans}"
         )
 
-    # The scale check is the one that catches silent unit bugs: HealthKit's
-    # canonical units are not the XML's display units, so a type whose ratio is
-    # not 1.0 needs an entry in UNIT_SCALE.
+    print("\nheart-rate series the XML database still holds as readings, read back here:")
+    rows = series_reading_diffs(con)
+    if not rows:
+        print("  none -- the export is newer than every series")
+    else:
+        here = sum(r[2] for r in rows)
+        there = sum(r[3] for r in rows)
+        off = [r for r in rows if abs((r[4] or 0) - (r[5] or 0)) > MEAN_BPM_TOLERANCE]
+        print(
+            f"  {len(rows):,} series: {here:,} readings here, {there:,} in the XML; "
+            f"{len(off):,} differ in mean by more than {MEAN_BPM_TOLERANCE} bpm"
+        )
+        for sid, d, n_here, n_there, bpm_here, bpm_there in off[:10]:
+            print(
+                f"  {d}  series {sid}  here={n_here:>5,}  xml={n_there:>5,}  "
+                f"mean {bpm_here or 0:5.1f} vs {bpm_there or 0:5.1f}"
+            )
+
     print("\nvalue scale per type (xml / live; anything but ~1.0 is a unit bug):")
-    rows = con.execute("""
-        -- Only the window both databases cover: the XML export is a snapshot and
-        -- everything after it would otherwise read as a scale difference.
-        WITH cutoff AS (SELECT max(local_date) AS d FROM old.records)
-        SELECT a.type, a.n AS live_n, round(b.v / nullif(a.v, 0), 4) AS ratio
-        FROM (SELECT type, count(*) n, avg(value) v FROM records
-              WHERE value IS NOT NULL AND local_date < (SELECT d FROM cutoff)
-              GROUP BY 1) a
-        JOIN (SELECT type, count(*) n, avg(value) v FROM old.records
-              WHERE value IS NOT NULL AND local_date < (SELECT d FROM cutoff)
-              GROUP BY 1) b USING (type)
-        WHERE a.n > 20 AND abs(coalesce(b.v / nullif(a.v, 0), 1) - 1) > 0.02
-        ORDER BY a.n DESC LIMIT 20
-    """).fetchall()
+    rows = scale_diffs(con)
     if not rows:
         print("  every type within 2% of the XML database")
     for t, n, ratio in rows:
@@ -1447,7 +1661,7 @@ def verify(new_db, xml_db):
     for t, n in con.execute("""
             SELECT type, count(*) n FROM records
             WHERE type LIKE 'type\\_%' ESCAPE '\\'
-            GROUP BY 1 ORDER BY n DESC LIMIT 15""").fetchall():
+            GROUP BY 1 ORDER BY n DESC, type LIMIT 15""").fetchall():
         print(f"  {t:<16} {n:>12,}")
     con.close()
 

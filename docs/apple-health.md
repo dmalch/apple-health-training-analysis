@@ -145,45 +145,94 @@ no XML counterpart.
 
 ### Workout heart rate older than 120 days is packed into series
 
-**Both routes lose a session's heart-rate stream once it is four months old.** The
-phone packs the dense samples a workout records into quantity series 120 days after
-the fact: one `samples` row per series, `quantity_sample_series` holding its point
-count and `hfd_key`, and the points in `quantity_series_data`, keyed by
-`series_identifier` = `hfd_key` — the same not-the-`data_id` trap as the routes.
-Point timestamps are absolute on the HealthKit epoch and values are canonical
-(count/s). In one backup every one of the 4,113 packed heart-rate series lay inside a
-workout; 832 were created 120 days to the day after they ended, and the history before
-them was worked through as a backlog over the eight months after the phone's first
-iOS 26 build.
+**A session's heart-rate stream is packed once it is four months old, and only the
+backup route can read it back.** The phone packs the dense samples a workout records
+into quantity series 120 days after the fact: one `samples` row per series,
+`quantity_sample_series` holding its point count and `hfd_key`, and the points in
+`quantity_series_data`, keyed by `series_identifier` = `hfd_key` — the same
+not-the-`data_id` trap as the routes. Point timestamps are absolute on the HealthKit
+epoch and values are canonical (count/s). A series starts at its first point and ends at
+its last point's timestamp plus duration, on every one of 4,255. In one backup every one
+of the 4,113 packed heart-rate series lay inside a workout; 832 were created 120 days to
+the day after they ended, and the history before them was worked through as a backlog
+over the eight months after the phone's first iOS 26 build.
 
-A series comes out as **one row**, on both routes. `quantity_samples` gives it a single
-value that is not the mean of its points (3 bpm above it on one), and it spans a
-median 14 minutes and 119 points. The XML export writes one `<Record>` per series too,
-so switching routes does not help. That backup held 4,255 heart-rate series with
-441,363 points between them, and nothing here reads the points yet. What it costs is
-per-sample zones: a 32-minute run reads as three heart-rate rows, and of 926
-sessions with packed heart rate, one still qualifies for real time in zone
-(`docs/method.md`), against 81 of the 97 sessions younger than 120 days.
+**iOS 27 also writes heart rate straight into series.** From 16 Sep 2026 the same
+backup held 142 more, 3,786 points between them, created a median two minutes after
+they ended (the latest nine hours), none inside a workout, 33 from the chest strap.
+Series are not only a matter of age.
+
+Read as a sample, a series is **one row**. `quantity_samples` gives it a single value
+that is not the mean of its points (3 bpm above it on one), and it spans a median 14
+minutes and 119 points. The XML export writes one `<Record>` per series with that value,
+so the XML route cannot get the stream back. Read that way, a 32-minute run is three
+heart-rate rows, and of 926 sessions with packed heart rate one qualified for real time
+in zone (`docs/method.md`), against 81 of the 97 sessions younger than 120 days.
+
+**The backup route reads the points, and they are run-length encoded**: consecutive
+identical readings become one point whose `duration` runs from the first of them to the
+last. An XML export that predated the packing of 95 series settled it. Their 13,959
+original readings had become 9,947 points; every point with a duration had absorbed at
+least two readings, the first at its timestamp and the last at timestamp + duration
+(2,602 of 2,603), a median 5 s apart and never more than 11 s inside one point; and
+13,947 of the readings carried their point's value exactly. Across the whole backup 29%
+of heart-rate points carry a duration, 10,000 of them longer than the 15 s
+`MAX_SAMPLE_GAP_S` credits a sample with, the longest 124 s. The strap's never do.
+
+So the converter gives a point back as readings at both of its ends and evenly in
+between, at its series' own cadence: the median gap from one point's end to the next
+point's start, which is one reading interval because the next reading differed — 5 s for
+the watch and AirPods, 1 s for the strap. That guess only decides how many readings come
+back. On the 95 series it made 13,884 readings where there had been 13,959; a fixed 5 s
+would have made 13,926, and the fewest that keep every gap under 15 s, 12,797. Coverage
+and zones do not
+depend on it as long as the spacing stays under 15 s. Against the export, the same 20
+of the 21 sessions in those days qualify for per-sample zones as from the XML (3 did
+before), each within half a point of the XML's coverage and of its share of every zone.
+
+Readings rather than points with an end: `analyze.py` and `analyze_intervals.py` credit
+a sample with the seconds until the next one, so point rows would have needed every
+per-sample reader taught about `end_date` — and on the XML route a series' own row spans
+its whole 14 minutes, so honouring `end_date` there credits 14 minutes to a value that
+is not a reading. Readings keep `records` the shape both routes already share, and give
+the per-sample means (a workout's average when the phone kept none, an interval's
+average HR) their original weighting.
+
+Each reading is a `records` row carrying its series' `data_id`, so **`records.id` is no
+longer unique on this route**: `GROUP BY id` gives a series back, and the series'
+metadata — `_HKPrivateHeartRateContext`, on 4,252 of the 4,255 — still reaches every
+reading, as it reached each sample before the phone packed them. The series' own row
+moves to `quantity_series`, with `points` and `readings`, because it is what the XML
+holds and what `--verify` compares. That backup's 441,363 points came back as 639,994
+readings, taking `records` from 5.13M rows to 5.77M and the build from 39 s to 42.
+
+Workouts the phone kept no heart-rate statistics for — 973 in that backup, 881 of them
+from 2020 to 2022 — take their average, maximum and minimum from the samples inside
+their window, so they moved too. 485 changed: the maximum rose on 464, by 16 bpm on
+average, because a series' single value had stood in for its highest reading, and 11
+short sessions that had no sample starting inside them got an average for the first
+time. The average itself moved by 1.8 bpm on average, 25 at most.
+
+Only heart rate is read this way (`SERIES_READ_AS_POINTS`). Energy, distance and steps
+are packed the same way, but there a series' value is the sum of its points, so daily
+totals survive to the decimal as one row while their row counts drop about tenfold. The
+other types that arrive as series hold readings like heart rate — environmental audio
+exposure (102,816 series, 7.3M points), headphone audio, sound reduction, running speed,
+power, stride, oscillation and ground contact, cycling power and cadence — but nothing
+here reads them per sample, and all of them expanded would more than double `records`.
 
 Only the dense in-workout stream is packed. The watch's background readings stay
 individual samples, and so does a chest strap's stream: on a strap day the watch was
-packed and 2,787 strap samples were not. Energy, distance and steps are packed the same
-way, but there a series' value is the sum of its points, so daily totals survive to the
-decimal while their row counts drop about tenfold.
-
-The points are **run-length encoded**: consecutive identical readings become one point
-whose `duration` spans them. On five days packed on iOS 27, 4,857 samples became 3,661
-points, and each of the other 1,196 lay inside a point's duration, with the same value
-in the XML export. Reading them back needs that duration, and a point can span more
-than the 15 s `MAX_SAMPLE_GAP_S` credits a sample with.
+packed and 2,787 strap samples were not.
 
 **So an XML export and a later backup disagree on every day that turned 120 days old in
-between**, and not by a handful. Against an export five weeks older, a backup had lost
-15% to 87% of the heart-rate rows on each workout day of the month that aged past 120
-days in between (one day: 522 against 2,170), and the day's mean fell by up to 50 bpm,
-because the workout stream
-shrank to a few rows while the background readings stayed. The strap days lost the
-least and kept their mean.
+between**, counted as the rows each stores, and not by a handful. Against an export five
+weeks older, a backup had lost 15% to 87% of the heart-rate rows on each workout day of
+the month that aged past 120 days in between (one day: 522 against 2,170), and the day's
+mean fell by up to 50 bpm, because the workout stream shrank to a few rows while the
+background readings stayed. The strap days lost the least and kept their mean. Read back
+as readings, the 14 days of that month agree again: counts within 1.6% of the export's
+(2,136 against 2,170 on the worst) and means within 0.4 bpm.
 
 ### Structured-workout blocks: `workout_activities` → `workout_blocks`
 
@@ -317,8 +366,16 @@ across sessions has to come from the same method.**
   (routes), 119 → `binary_samples` (heartbeat series), 144 → `ecg_samples`.
 - `--verify <xml-built.duckdb>` is the acceptance test: quantity and category rows
   without a value, each day's HeartRate count, completeness and mean over the days both
-  databases cover, the per-type value-scale ratio, and workouts matched on start time.
-  Run it while both sources still overlap, because that window closes — and read the
+  databases cover, heart-rate series read back against an export that still holds their
+  readings, the per-type value-scale ratio, and workouts matched on start time. The
+  day-by-day and scale checks fold each series back into the one row the phone stores,
+  because that is what the XML holds: compared as readings, 1,314 days differed where 799
+  had, and heart rate came out 13% off in the scale check, which that check reads as a
+  unit bug. The series check is the only one on how the points are read back, and it
+  needs an export older than the packing — against one five weeks older, 95 series gave
+  14,000 readings where the export held 14,050 over the same spans, and no series' mean
+  was more than 0.5 bpm off. Run it while both sources still overlap, because that window
+  closes — and read the
   days packed after the export as the phone's doing, not the converter's (*Workout
   heart rate older than 120 days is packed into series*, above). Those days also push
   energy, distance and steps 2–10% off in the scale check, since a packed row is a sum;
@@ -433,6 +490,7 @@ either database.
 | `workout_statistics` | thousands | per-workout HR / distance / energy aggregates |
 | `workouts` | thousands | one row per workout |
 | `activity_summary` | thousands | the daily rings |
+| `quantity_series` | thousands | each heart-rate series as the one row the phone stores; `records` holds its readings — **backup route only** |
 | `workout_blocks` | hundreds | blocks of a structured workout — **backup route only** |
 
 Every timestamp is a real `TIMESTAMPTZ`, and every table also carries `local_date` /
@@ -441,9 +499,11 @@ was this" questions: a `TIMESTAMPTZ` renders in the session time zone, and a 00:
 workout otherwise lands on the wrong date.
 
 **The two routes do not produce the same schema.** An XML-built database has no
-`workout_blocks`, no `devices`, no `sources`; its `route_points` is keyed by
-`route_file` with no `local_date` and no `workout_id`, so filter it by `t` and join
-sessions by timestamp.
+`workout_blocks`, no `quantity_series`, no `devices`, no `sources`; its `route_points`
+is keyed by `route_file` with no `local_date` and no `workout_id`, so filter it by `t`
+and join sessions by timestamp. And the two fill `records` differently where heart rate
+was packed into series: the XML holds one row per series, the backup database the
+readings, all under the series' `id`.
 
 ### Views
 

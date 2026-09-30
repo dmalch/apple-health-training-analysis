@@ -32,6 +32,7 @@ import unittest
 import duckdb
 
 import healthdb_to_duckdb as conv
+from analyze import MAX_SAMPLE_GAP_S
 
 APPLE_EPOCH = datetime.datetime(2001, 1, 1, tzinfo=datetime.UTC)
 
@@ -86,6 +87,14 @@ CREATE TABLE associations (ROWID INTEGER PRIMARY KEY, destination_object_id INTE
                            sync_identity INTEGER, type INTEGER, deleted INTEGER,
                            creation_date REAL, destination_sub_object_id INTEGER,
                            behavior INTEGER);
+-- A quantity series: one `samples` row, its points in quantity_series_data under
+-- series_identifier = hfd_key -- again NOT the data_id.
+CREATE TABLE quantity_sample_series (data_id INTEGER PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0,
+                                     insertion_era INTEGER, hfd_key INTEGER UNIQUE NOT NULL,
+                                     series_location INTEGER NOT NULL);
+CREATE TABLE quantity_series_data (series_identifier INTEGER NOT NULL, timestamp REAL NOT NULL,
+                                   value REAL NOT NULL, duration REAL NOT NULL,
+                                   PRIMARY KEY (series_identifier, timestamp)) WITHOUT ROWID;
 CREATE TABLE metadata_keys (ROWID INTEGER PRIMARY KEY, key TEXT);
 CREATE TABLE metadata_values (ROWID INTEGER PRIMARY KEY, key_id INTEGER, object_id INTEGER,
                               value_type INTEGER, string_value TEXT, numerical_value REAL,
@@ -130,6 +139,8 @@ DEVICES = [
 ]
 
 WORKOUT_START = apple_time(2026, 8, 26, 8, 0)
+SERIES_START = apple_time(2026, 8, 26, 6, 0)
+FAST_START = apple_time(2026, 8, 26, 7, 0)
 
 
 class Archived(dict):
@@ -306,6 +317,61 @@ def build_fixture(root):
     late = apple_time(2026, 8, 26, 22, 30)
     sample(5, late, late, 1, quantity=2.0)
 
+    # Watch heart rate the phone packed into a series. The series' own value,
+    # 135 bpm, is none of its readings. Its points are run-length encoded: 132
+    # held from +5 s to +25 s is five readings 5 s apart, 144 from +35 s to +45 s
+    # three -- 5 s being the gap between one point's end and the next's start.
+    series_id = sample(5, SERIES_START, SERIES_START + 50, 1, quantity=2.25)
+    con.execute(
+        "INSERT INTO quantity_sample_series VALUES (?,?,?,?,?)", (series_id, 5, None, 4242, 0)
+    )
+    con.executemany(
+        "INSERT INTO quantity_series_data VALUES (?,?,?,?)",
+        [
+            (4242, SERIES_START, 2.1, 0.0),  # 126
+            (4242, SERIES_START + 5, 2.2, 20.0),  # 132
+            (4242, SERIES_START + 30, 2.3, 0.0),  # 138
+            (4242, SERIES_START + 35, 2.4, 10.0),  # 144
+            (4242, SERIES_START + 50, 2.3, 0.0),  # 138
+        ],
+    )
+    # A decoy filed under the series' data_id, the join that looks right.
+    con.execute(
+        "INSERT INTO quantity_series_data VALUES (?,?,?,?)", (series_id, SERIES_START, 0.5, 0.0)
+    )
+    # The heart-rate context the watch attaches to a series, as to every sample.
+    con.execute(
+        "INSERT INTO metadata_values VALUES (?,?,?,?,?,?,?,?)",
+        (5, 5, series_id, 1, None, 6.0, None, None),
+    )
+
+    # A series sampled once a second: its points expand at 1 s, not at the
+    # watch's 5. 96 bpm held for 3 s is four readings.
+    fast_id = sample(5, FAST_START, FAST_START + 6, 3, quantity=1.6)
+    con.execute(
+        "INSERT INTO quantity_sample_series VALUES (?,?,?,?,?)", (fast_id, 4, None, 4343, 0)
+    )
+    con.executemany(
+        "INSERT INTO quantity_series_data VALUES (?,?,?,?)",
+        [
+            (4343, FAST_START, 1.5, 0.0),  # 90
+            (4343, FAST_START + 1, 1.6, 3.0),  # 96
+            (4343, FAST_START + 5, 1.7, 0.0),  # 102
+            (4343, FAST_START + 6, 1.8, 0.0),  # 108
+        ],
+    )
+
+    # Energy is packed the same way, but its series' value is the sum of its
+    # points, so it stays one row.
+    energy_id = sample(10, SERIES_START, SERIES_START + 50, 1, quantity=12.5)
+    con.execute(
+        "INSERT INTO quantity_sample_series VALUES (?,?,?,?,?)", (energy_id, 2, None, 4444, 0)
+    )
+    con.executemany(
+        "INSERT INTO quantity_series_data VALUES (?,?,?,?)",
+        [(4444, SERIES_START, 5.0, 0.0), (4444, SERIES_START + 30, 7.5, 0.0)],
+    )
+
     # A workout with two activity segments, one long and easy, one short and
     # hard. The workout-level average has to be weighted by segment length.
     wid = sample(79, WORKOUT_START, WORKOUT_START + 4800, 2)
@@ -466,6 +532,7 @@ def build_fixture(root):
             (2, "HKIndoorWorkout"),
             (3, "HKTimeZone"),
             (4, "_HKPrivateWorkoutConfiguration"),
+            (5, "_HKPrivateHeartRateContext"),
         ],
     )
     con.executemany(
@@ -553,8 +620,8 @@ class ConverterTest(unittest.TestCase):
     def test_every_sensor_is_labelled(self):
         got = dict(self.con.execute("SELECT sensor, count(*) FROM hr GROUP BY 1").fetchall())
         self.assertEqual(got.get("strap"), 1)
-        self.assertEqual(got.get("airpods"), 1)
-        self.assertEqual(got.get("watch"), 2)
+        self.assertEqual(got.get("airpods"), 1 + 7)  # one sample, one series of seven readings
+        self.assertEqual(got.get("watch"), 2 + 11)  # two samples, one series of eleven
         self.assertNotIn("other", got)
 
     # -------------------------------------------------------------- deletions
@@ -577,6 +644,88 @@ class ConverterTest(unittest.TestCase):
     def test_no_heart_rate_sample_is_without_a_value(self):
         n = self.con.execute("SELECT count(*) FROM hr WHERE bpm IS NULL").fetchone()[0]
         self.assertEqual(n, 0)
+
+    # --------------------------------------------------------- packed series
+
+    def series_readings(self, start):
+        """(seconds after `start`, bpm, seconds spanned) for the series starting there."""
+        t0 = APPLE_EPOCH + datetime.timedelta(seconds=start)
+        rows = self.con.execute(
+            """
+            SELECT start_date, end_date, value FROM records
+            WHERE id = (SELECT id FROM quantity_series WHERE start_date = ?)
+            ORDER BY start_date""",
+            [t0],
+        ).fetchall()
+        return [
+            (round((s - t0).total_seconds(), 3), round(v, 3), (e - s).total_seconds())
+            for s, e, v in rows
+        ]
+
+    def test_a_heart_rate_series_is_read_as_its_readings(self):
+        got = self.series_readings(SERIES_START)
+        self.assertEqual([r[0] for r in got], [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50])
+        self.assertEqual(
+            [r[1] for r in got], [126, 132, 132, 132, 132, 132, 138, 144, 144, 144, 138]
+        )
+
+    def test_each_reading_is_an_instant_like_the_samples_it_replaces(self):
+        self.assertEqual({r[2] for r in self.series_readings(SERIES_START)}, {0.0})
+
+    def test_a_point_is_expanded_at_its_own_series_cadence(self):
+        # 1 s between one point's end and the next point's start, so the 3 s run
+        # of 96 bpm is four readings -- a fixed 5 s would have made it two.
+        got = self.series_readings(FAST_START)
+        self.assertEqual([r[0] for r in got], [0, 1, 2, 3, 4, 5, 6])
+        self.assertEqual([r[1] for r in got], [90, 96, 96, 96, 96, 102, 108])
+
+    def test_the_series_own_value_is_not_a_reading(self):
+        # 135 bpm summarises the series and matches none of its readings; kept
+        # beside them it would be one more reading at the first one's instant.
+        n = self.con.execute("SELECT count(*) FROM hr WHERE bpm = 135").fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_the_series_row_is_kept_for_verify(self):
+        rows = self.con.execute(
+            "SELECT type, value, points, readings FROM quantity_series ORDER BY start_date"
+        ).fetchall()
+        self.assertEqual(
+            [(t, round(v, 3), p, r) for t, v, p, r in rows],
+            [("HeartRate", 135.0, 5, 11), ("HeartRate", 96.0, 4, 7)],
+        )
+
+    def test_series_points_are_keyed_by_hfd_key_not_by_data_id(self):
+        # The decoy reads 30 bpm and sits under the series' data_id.
+        n = self.con.execute("SELECT count(*) FROM hr WHERE bpm = 30").fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_every_reading_keeps_the_series_metadata(self):
+        n = self.con.execute("""
+            SELECT count(*) FROM records r JOIN record_metadata m ON m.record_id = r.id
+            WHERE m.key = '_HKPrivateHeartRateContext'""").fetchone()[0]
+        self.assertEqual(n, 11)
+
+    def test_a_summed_series_stays_one_row(self):
+        # Energy, distance and steps series carry their total; one row keeps the
+        # daily sum exact, and its points would add nothing to it.
+        rows = self.con.execute(
+            "SELECT value FROM records WHERE type = 'ActiveEnergyBurned' AND value IS NOT NULL"
+        ).fetchall()
+        self.assertEqual(rows, [(12.5,)])
+
+    def test_readings_give_the_zone_split_the_whole_series(self):
+        # analyze.py credits a sample with the seconds until the next one, and
+        # with nothing when that is over MAX_SAMPLE_GAP_S. The run of 132 bpm is
+        # one point, 25 s before the next; read back as readings, all 50 s count.
+        covered = self.con.execute(
+            f"""
+            SELECT sum(d) FROM (
+                SELECT epoch(lead(t) OVER (ORDER BY t, bpm) - t) AS d FROM hr
+                WHERE sensor = 'watch' AND t BETWEEN ? AND ? + INTERVAL 50 SECOND)
+            WHERE d <= {MAX_SAMPLE_GAP_S}""",
+            [APPLE_EPOCH + datetime.timedelta(seconds=SERIES_START)] * 2,
+        ).fetchone()[0]
+        self.assertAlmostEqual(covered, 50.0, places=6)
 
     def test_source_names_come_from_the_companion_database(self):
         names = {r[0] for r in self.con.execute("SELECT DISTINCT source_name FROM hr").fetchall()}
@@ -830,9 +979,23 @@ class VerifyTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="healthdb-verify-")
         secure = build_fixture(cls.tmp)
-        cls.xml = os.path.join(cls.tmp, "xml.duckdb")
+        cls.built = os.path.join(cls.tmp, "built.duckdb")
         with contextlib.redirect_stderr(io.StringIO()):
-            conv.build(secure, cls.xml, "Europe/Berlin")
+            conv.build(secure, cls.built, "Europe/Berlin")
+        # The reference stands in for an XML database, which holds each series
+        # as one row, not as its readings.
+        cls.xml = os.path.join(cls.tmp, "xml.duckdb")
+        shutil.copy(cls.built, cls.xml)
+        con = duckdb.connect(cls.xml)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE records AS
+            SELECT * FROM records WHERE id NOT IN (SELECT id FROM quantity_series)
+            UNION ALL BY NAME
+            SELECT id, type, source_name, device_name, start_date, end_date, local_date,
+                   local_time, value, {conv.SERIES_READ_AS_POINTS[0]} AS type_code
+            FROM quantity_series""")
+        con.execute("DROP TABLE quantity_series")
+        con.close()
 
     @classmethod
     def tearDownClass(cls):
@@ -841,21 +1004,60 @@ class VerifyTest(unittest.TestCase):
     # The watch reading of 26 Aug; the one of the 27th reads 120 too.
     WATCH = "type = 'HeartRate' AND local_date = DATE '2026-08-26' AND value = 120"
 
-    def live(self, *edits):
-        """A copy of the reference with `edits` applied, the reference attached as `old`."""
+    def live(self, *edits, reference=None):
+        """A copy of the built database with `edits` applied, `reference` attached as `old`."""
         path = os.path.join(self.tmp, f"{self._testMethodName}.duckdb")
-        shutil.copy(self.xml, path)
+        shutil.copy(self.built, path)
         con = duckdb.connect(path)
         self.addCleanup(con.close)
         for sql in edits:
             con.execute(sql)
-        con.execute(f"ATTACH '{self.xml}' AS old (READ_ONLY)")
+        con.execute(f"ATTACH '{reference or self.xml}' AS old (READ_ONLY)")
         return con
 
     def test_identical_databases_report_nothing(self):
+        # Identical but for the series, which the live side holds as readings.
         con = self.live()
         self.assertEqual(conv.hr_day_diffs(con), [])
         self.assertEqual(conv.valueless_records(con), [])
+
+    def test_the_readings_are_not_a_unit_bug(self):
+        # Compared as readings, the series moved heart rate 13% in the scale
+        # check on a real backup, which that check reads as a wrong unit. It
+        # skips types with 20 rows or fewer, so both sides get 20 more.
+        more = f"""
+            INSERT INTO records SELECT records.* REPLACE (100.0 AS value,
+                start_date + INTERVAL (i) SECOND AS start_date,
+                end_date + INTERVAL (i) SECOND AS end_date)
+            FROM records, range(1, 21) r(i) WHERE {self.WATCH}"""
+        reference = os.path.join(self.tmp, "reference-scale.duckdb")
+        shutil.copy(self.xml, reference)
+        con = duckdb.connect(reference)
+        con.execute(more)
+        con.close()
+        self.assertEqual(conv.scale_diffs(self.live(more, reference=reference)), [])
+
+    def test_an_export_newer_than_the_series_holds_no_readings_to_check(self):
+        self.assertEqual(conv.series_reading_diffs(self.live()), [])
+
+    def test_readings_are_checked_against_an_export_that_still_has_them(self):
+        # An export taken before the phone packed the session holds the readings
+        # themselves -- here, the live database's own, with one value changed.
+        older = os.path.join(self.tmp, "older-export.duckdb")
+        shutil.copy(self.built, older)
+        con = duckdb.connect(older)
+        con.execute("DROP TABLE quantity_series")
+        con.execute(f"""
+            UPDATE records SET value = 150
+            WHERE type = 'HeartRate' AND start_date = TIMESTAMPTZ '{APPLE_EPOCH.isoformat()}'
+                  + INTERVAL {int(FAST_START)} SECOND""")
+        con.close()
+        rows = conv.series_reading_diffs(self.live(reference=older))
+        self.assertEqual([(r[2], r[3]) for r in rows], [(7, 7), (11, 11)])
+        # The changed reading moved the fast series' mean; the other matches.
+        _id, _day, _n, _m, here, there = rows[0]
+        self.assertAlmostEqual(there - here, 60 / 7, places=6)
+        self.assertAlmostEqual(rows[1][4], rows[1][5], places=6)
 
     def test_a_sample_without_a_value_is_reported_although_the_counts_match(self):
         con = self.live(f"UPDATE records SET value = NULL WHERE {self.WATCH}")
@@ -873,7 +1075,7 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         _day, live_n, xml_n, no_value, live_bpm, xml_bpm = rows[0][:6]
         self.assertEqual((live_n, no_value), (xml_n, 0))
-        self.assertAlmostEqual(live_bpm - xml_bpm, 10 / 3, places=6)
+        self.assertAlmostEqual(live_bpm - xml_bpm, 10 / live_n, places=6)
 
     def test_days_past_the_xml_snapshot_are_not_differences(self):
         # The live database always runs on past the export. Counted as

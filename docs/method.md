@@ -88,13 +88,26 @@ session-level classification rather than time in zone.
 Not every session qualifies. A workout needs samples spanning at least 60% of its
 duration (`MIN_ZONE_COVERAGE`), with each sample counting for at most 15 s
 (`MAX_SAMPLE_GAP_S`). Below that the stream is too thin to describe the session and it
-keeps the average-based treatment. **In practice that means the last four months.**
-The phone packs a workout's heart-rate stream into series 120 days after the fact,
-and both routes read each series as one row (`docs/apple-health.md`), so an older
-28-minute elliptical session that recorded about 200 readings shows two or three. Of
-926 sessions packed that way in one backup, one qualified; of the 97 younger than
+keeps the average-based treatment. **On an XML-built database that means the last four
+months.** The phone packs a workout's heart-rate stream into series 120 days after the
+fact, and the export writes each series as one row (`docs/apple-health.md`), so an older
+28-minute elliptical session that recorded about 200 readings shows two or three. Read
+that way, of 926 sessions packed in one backup one qualified; of the 97 younger than
 120 days, 81 did. A session that falls out of the per-sample split as it ages has not
 changed — only what the phone still keeps of it.
+
+**A backup-route database reads the series back as readings, and the history returns.**
+On the same backup 1,159 sessions qualified where 325 had, and none dropped out. 324 of
+the 325 kept their zones to the last digit; the other was the one packed session that had
+qualified on its unpacked readings, at 68% coverage, now 94%. The readings are a
+reconstruction — the points are run-length encoded, and the readings between a point's
+two ends are spaced at its series' cadence — but against an export that still held the
+originals, the same 20 of 21 sessions qualified, each within half a point of the
+original coverage and of every zone's share. The report's count of sessions too sparse
+to split hardly moves (255 to 241): most of the sessions that gained had no two samples
+within 15 s of each other before, and a session like that is counted as neither. So a
+report from the backup and one from an XML export differ in how many sessions carry real
+zones well beyond the last four months; compare them only on sessions both split.
 
 Only samples with a value count, for coverage as well as for zones. A backup-route
 database built before the converter skipped deleted samples carries each one as a
@@ -107,7 +120,9 @@ and the same database gave three different reports in twenty runs.
 
 **What changes when you switch.** On sessions that have both, the easy/hard headline
 barely moves, but the *shape* does: Z1 up about 12 points, Z2 down 11, Z3 down 7, Z4 up
-5. The average-based method inflates the middle at the expense of both ends. The real
+5. With packed series read back, the same year had 101 such sessions instead of 54, and
+the shift came out Z1 up 8, Z2 down 14, Z3 down 1, Z4 up 5, Z5 up 2. Either way the
+average-based method inflates the middle at the expense of both ends. The real
 gains are per-session: a 4×4 that averages Z4 holds 29% Z5, and a circuit class that
 averages Z3 spends 41% of its time in Z4 — neither visible before.
 
