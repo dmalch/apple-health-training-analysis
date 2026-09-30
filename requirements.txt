@@ -6,4 +6,4 @@ duckdb==1.5.5
 # Python, and raises "Required module 'pytz' failed to import" without it.
 # Every table here carries TIMESTAMPTZ columns, so this is a hard runtime
 # dependency that duckdb does not declare for us.
-pytz==2026.3.post1
+pytz==2026.4
