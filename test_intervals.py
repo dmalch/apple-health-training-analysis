@@ -269,6 +269,48 @@ class WindowStatsTest(unittest.TestCase):
         self.assertAlmostEqual(st["end_hr"], 150.0)
 
 
+class HeartRateSeriesTest(unittest.TestCase):
+    """What hr_series hands on goes into min(), statistics.mean() and sorted().
+
+    A sample without a value raises in all three, and a database built from a
+    backup before the converter dropped deleted samples carries thousands of
+    them. Two samples at one instant must also come back in the same order on
+    every run, or whichever is first differs between two identical reports.
+    """
+
+    def setUp(self):
+        self.con = duckdb.connect()
+        self.addCleanup(self.con.close)
+        self.con.execute(
+            "CREATE TABLE hr ("
+            " t TIMESTAMPTZ, bpm DOUBLE, sensor VARCHAR, device_name VARCHAR, source_name VARCHAR)"
+        )
+        self.con.executemany(
+            "INSERT INTO hr VALUES (?, ?, 'watch', 'Apple Watch', 'Watch')",
+            [
+                (at(0), 150.0),
+                (at(1), None),  # a deleted sample, at the instant of a real one
+                (at(1), 152.0),
+                (at(2), 160.0),  # a tie, inserted against value order
+                (at(2), 140.0),
+            ],
+        )
+
+    def test_samples_without_a_value_are_left_out(self):
+        got = ai.hr_series(self.con, at(0), at(10))
+        self.assertEqual(len(got), 4)
+        self.assertNotIn(None, [row[1] for row in got])
+
+    def test_samples_sharing_an_instant_come_back_in_value_order(self):
+        got = ai.hr_series(self.con, at(0), at(10))
+        self.assertEqual([row[1] for row in got], [150.0, 152.0, 140.0, 160.0])
+
+    def test_the_sensor_audit_runs_over_them(self):
+        samples = ai.hr_series(self.con, at(0), at(10))
+        per_sensor = ai.sensor_audit(samples, at(0), at(10), io.StringIO())
+        self.assertEqual(len(per_sensor["watch"]), 4)
+
+
 # A second synthetic session, shaped like the one that exposed the faults the
 # command-line tests below pin: a warm-up, a 20-minute tempo block, four
 # one-minute strides with two-minute recoveries, and a cool-down.

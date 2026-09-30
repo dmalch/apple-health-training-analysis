@@ -139,9 +139,13 @@ def pick_workout(con, date, workout_id):
 
 
 def hr_series(con, start, end):
+    # A sample without a value raises in every min(), mean() and sort downstream.
+    # Samples can share an instant, so the order runs over every column: by time
+    # alone, which came first was the database's choice on each run.
     return con.execute(
         "SELECT t, bpm, sensor, device_name, source_name FROM hr"
-        " WHERE t BETWEEN ? AND ? ORDER BY t",
+        " WHERE t BETWEEN ? AND ? AND bpm IS NOT NULL"
+        " ORDER BY t, bpm, sensor, device_name, source_name",
         [start, end],
     ).fetchall()
 
