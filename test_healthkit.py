@@ -225,9 +225,11 @@ class Fixture(unittest.TestCase):
     def test_events_and_statistics(self):
         self.assertEqual(self.q("SELECT type FROM workout_events WHERE workout_id = ? ORDER BY date",
                                 conv.hk_id(uid(50))), [("Pause",), ("Resume",)])  # fmt: skip
-        # Workout-level row plus one per activity, as the backup route has.
-        self.assertEqual(self.q("SELECT count(*) FROM workout_statistics WHERE workout_id = ?",
-                                conv.hk_id(uid(50))), [(7,)])  # fmt: skip
+        # Workout-level row plus one per activity, as the backup route has, and
+        # only the workout-level one is the session's total.
+        self.assertEqual(self.q("SELECT is_primary, count(*) FROM workout_statistics "
+                                "WHERE workout_id = ? GROUP BY 1 ORDER BY 1",
+                                conv.hk_id(uid(50))), [(False, 6), (True, 1)])  # fmt: skip
 
     def test_views_and_activity_summary(self):
         self.assertEqual(self.q("SELECT count(*) FROM hr"), [(5,)])

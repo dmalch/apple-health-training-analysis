@@ -538,7 +538,8 @@ def build_workouts(con, workouts, tz):
     con.execute(f"""
         CREATE TABLE workout_statistics AS
         SELECT {wid} AS workout_id, w.type, to_timestamp(w."start") AS start_date,
-               to_timestamp(w."end") AS end_date, w.average, w.minimum, w.maximum, w.sum, w.unit
+               to_timestamp(w."end") AS end_date, w.average, w.minimum, w.maximum, w.sum, w.unit,
+               w.scope = 'workout' AS is_primary
         FROM wk_stats w
     """)
     con.execute(f"""

@@ -457,22 +457,20 @@ whole days both cover (`healthkit_to_duckdb.py --compare`):
   maximum. The same held for energy, distance, steps, running dynamics, HRV, resting
   heart rate, VO2 max, sleep and stand hours. `daily_metrics` and
   `hr_sources_by_day` agreed on every day, to float summation order.
-- **All 16 workouts matched on start time**, and 13 were identical in duration,
-  distance, energy, heart rate, indoor flag, route points, events and blocks,
-  a half marathon and the gym classes among them.
+- **All 16 workouts matched on start time and are identical** in duration,
+  distance, energy, heart rate, indoor flag, route points, events and blocks, a half
+  marathon and the gym classes among them.
 - **`analyze_intervals.py` printed the same report from both** for four sessions,
   two of them structured: every rep, every split, the sensor audit, the zones. Only
-  the header differed: the route's name, and on the structured runs the energy and
-  average heart rate of the next point.
-- **The three workouts that differed are a backup-route bug.** Every structured
-  run showed double the energy on the backup side: 1,237 kcal against 619, 682
-  against 372, 208 against 104. That converter takes energy from
-  `workout_statistics` summed over *all* of a workout's activities, and a structured
-  workout has a primary activity for the whole session plus one per block, so the
-  total is counted twice. On one run it also reported `min_hr` 0, from a block row
-  whose minimum was stored as 0, and its average heart rate is its own duration-weighted
-  figure over the same double rows (134.51 where Apple says 135.74). The HealthKit
-  numbers are Apple's own per-session statistics. Not fixed on the backup route yet.
+  the route's name differs.
+- **That held only after this comparison found a backup-route bug.** At first the
+  three structured runs differed: the backup side had double the energy (1,237 kcal
+  against 619, 682 against 372, 208 against 104), an average heart rate of its own
+  (134.51 where Apple says 135.74), and on one run a `min_hr` of 0. That converter
+  summed `workout_statistics` over a structured workout's primary activity *and* its
+  blocks, so it counted the session twice. It now reads the primary rows only
+  (*Structured-workout blocks*, above), and its numbers equal HealthKit's
+  per-session statistics.
 - Two samples were only in the HealthKit database, a weekly walking-steadiness value
   and one sound-reduction reading. Both were written to the phone after the backup
   was taken, so the HealthKit side was simply newer.
@@ -481,11 +479,9 @@ whole days both cover (`healthkit_to_duckdb.py --compare`):
 
 Gains over the backup route: the Activity rings (`activity_summary`, an empty stub
 there); the beat times of every heartbeat series (`heartbeat_points`, 17,497 beats in
-30 days, decoded by neither other route); names for three codes the backup route
-leaves as `type_<n>`, identified by identical counts and means: **275 =
-`AppleSleepingBreathingDisturbances`, 298 = `EstimatedWorkoutEffortScore`, 304 =
-`WorkoutEffortScore`**; and data as fresh as the last sync rather than the last
-backup.
+30 days, decoded by neither other route); and data as fresh as the last sync
+rather than the last backup. It also named three codes the backup route had left as
+`type_<n>`, by identical counts and means: 275, 298 and 304, now named there too.
 
 What HealthKit does not hand out, over those 24 days:
 
@@ -537,8 +533,7 @@ expose it. `route_file` is `hk_<route UUID>`.
 ### Verdict
 
 Use it for the regular sync. It matched the backup route on everything the
-analysis reads, does not have that route's energy double-count on structured
-workouts, and replaces a manual Finder backup with one command. Keep the backup route
+analysis reads, and it replaces a manual Finder backup with one command. Keep the backup route
 for two things. One is history: the app reads back only as far as `--days` on its
 first or `--full` run, and a pull of the whole history, several million samples, has
 not been tried. The other is the handful of private types above. An expired 7-day
