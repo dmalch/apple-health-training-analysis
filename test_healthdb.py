@@ -474,6 +474,22 @@ def build_fixture(root):
             ),
         ],
     )
+    # Each block carries its own statistics, as on a real phone: a slice of the
+    # session the primary rows already total. The recovery block's minimum is
+    # stored as 0, as one real block's was.
+    con.executemany(
+        "INSERT INTO workout_statistics VALUES (?,?,?,?,?,?)",
+        [
+            (5, 10, 5, 2.2, 1.5, 2.4),
+            (6, 11, 5, 3.0, 2.5, 3.2),
+            (7, 12, 5, 2.3, 0.0, 2.9),
+            (8, 13, 5, 3.1, 2.6, 3.2),
+            (9, 10, 10, 60.0, None, None),
+            (10, 11, 10, 40.0, None, None),
+            (11, 12, 10, 20.0, None, None),
+            (12, 13, 10, 50.0, None, None),
+        ],
+    )
 
     # The GPS track. `hfd_key` is 720 while the sample's own data_id is something
     # else entirely; DECOY_POINTS sit under series_identifier = that data_id, so
@@ -761,6 +777,20 @@ class ConverterTest(unittest.TestCase):
     def test_workout_energy_is_summed_across_segments(self):
         kcal = self.con.execute("SELECT active_kcal FROM workouts").fetchone()[0]
         self.assertAlmostEqual(kcal, 400.0, places=6)
+
+    def test_block_statistics_are_not_counted_again(self):
+        # The blocks re-slice what the primary rows already total. Summed in,
+        # they gave 570 kcal for 400, and their stored-as-0 minimum read as a
+        # heart rate of 0.
+        row = self.con.execute("SELECT active_kcal, min_hr FROM workouts").fetchone()
+        self.assertAlmostEqual(row[0], 400.0, places=6)
+        self.assertAlmostEqual(row[1], 90.0, places=3)
+
+    def test_statistics_rows_say_which_are_the_session_totals(self):
+        rows = self.con.execute(
+            "SELECT is_primary, count(*) FROM workout_statistics GROUP BY 1 ORDER BY 1"
+        ).fetchall()
+        self.assertEqual(rows, [(False, 8), (True, 4)])
 
     def test_workout_rows_are_not_also_records(self):
         n = self.con.execute("SELECT count(*) FROM records WHERE type_code = 79").fetchone()[0]

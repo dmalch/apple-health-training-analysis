@@ -166,6 +166,11 @@ QUANTITY_TYPES = {
     # Identified here, not in HealthDB: 458 samples spanning 35.7-37.1 degC,
     # which is the sleeping skin-temperature range this project already knew.
     256: "AppleSleepingWristTemperature",
+    # Identified on 18 Oct 2026 against a HealthKit export of the same 24 days,
+    # where each named type had exactly the code's row count and mean.
+    275: "AppleSleepingBreathingDisturbances",
+    298: "EstimatedWorkoutEffortScore",
+    304: "WorkoutEffortScore",
 }
 
 CATEGORY_TYPES = {
@@ -380,9 +385,10 @@ WORKOUT_EVENT_TYPES = {
 }
 
 # Still unresolved on that database, all low volume except the first: 77 (62,971
-# rows, in no side table), 116 (6,368 category rows valued 0/1), 273, 275, 285,
-# 296, 298, 302, 304 (iOS 18+ quantity types HealthDB predates). They surface as
-# `type_<n>` rather than being dropped.
+# rows, in no side table), 116 (6,368 category rows valued 0/1), 273 (written by
+# the Medications app), 285, 296, 302 (iOS 18+ types HealthDB predates). They
+# surface as `type_<n>` rather than being dropped. HealthKit hands out none of
+# 77, 108, 109, 116, 198, 273 or 285, so they cannot be named from that side.
 
 
 # ------------------------------------------------------------------- locating
@@ -1001,7 +1007,10 @@ def build_workouts(con, cols, tz_default, dev_expr, dev_lookup, src_expr, src_lo
             -- A workout can hold several activities, each with its own stats
             -- row, so the workout-level average has to be weighted by how long
             -- each activity ran; taking the max instead reads ~20 bpm high on
-            -- interval sessions.
+            -- interval sessions. Only the primary rows: a structured workout's
+            -- blocks re-slice the session those rows already total, and summed
+            -- in they doubled its energy (1,237 kcal where Apple has 619) and
+            -- brought in a block minimum stored as 0.
             SELECT workout_id AS id,
                    round(sum(average * dur) FILTER (type = 'HeartRate')
                          / nullif(sum(dur) FILTER (type = 'HeartRate' AND average IS NOT NULL), 0),
@@ -1010,7 +1019,7 @@ def build_workouts(con, cols, tz_default, dev_expr, dev_lookup, src_expr, src_lo
                    min(minimum) FILTER (type = 'HeartRate')  AS min_hr,
                    sum(sum)     FILTER (type = 'ActiveEnergyBurned') AS active_kcal
             FROM (SELECT *, greatest(epoch(end_date) - epoch(start_date), 1) AS dur
-                  FROM workout_statistics)
+                  FROM workout_statistics WHERE is_primary)
             GROUP BY 1
         ) st USING (id)
     """)
@@ -1293,7 +1302,9 @@ def build_workout_statistics(con, cols):
             CAST(s."min" AS DOUBLE) * coalesce(sc.factor, 1.0)    AS minimum,
             CAST(s."max" AS DOUBLE) * coalesce(sc.factor, 1.0)    AS maximum,
             CAST(s.quantity AS DOUBLE) * coalesce(sc.factor, 1.0) AS sum,
-            sc.unit                                      AS unit
+            sc.unit                                      AS unit,
+            -- The session's own totals; a block's rows are a slice of them.
+            a.is_primary_activity = 1                    AS is_primary
         FROM hk.workout_statistics s
         JOIN hk.workout_activities a ON a.ROWID = s.workout_activity_id
         LEFT JOIN hk_types t ON t.code = s.data_type
@@ -1399,7 +1410,7 @@ def stub_missing(con):
         CREATE TABLE IF NOT EXISTS workout_statistics (
             workout_id BIGINT, type VARCHAR, start_date TIMESTAMPTZ,
             end_date TIMESTAMPTZ, average DOUBLE, minimum DOUBLE,
-            maximum DOUBLE, sum DOUBLE, unit VARCHAR)""")
+            maximum DOUBLE, sum DOUBLE, unit VARCHAR, is_primary BOOLEAN)""")
     con.execute("""
         CREATE TABLE IF NOT EXISTS activity_summary (
             local_date DATE, active_energy DOUBLE, active_energy_goal DOUBLE,
