@@ -444,7 +444,9 @@ What it fixes is the backup's cost, not its content. On iOS 27 the scripted back
 died on the on-phone passcode prompt every time (see the health-sync skill), so a
 sync meant Finder, the passcode and a full backup. Through HealthKit, each type
 resumes from a saved anchor, and a run with nothing new took 10 s end to end. The
-first 30 days took 58 s: 273k samples, 19 workouts, 39k route points.
+first 30 days took 58 s: 273k samples, 19 workouts, 39k route points. Half an hour
+later an incremental run took 14 s and brought exactly what was new: 23 samples
+none of the earlier batches held, and one deletion.
 
 ### Measured against the backup route
 
@@ -527,8 +529,15 @@ expose it. `route_file` is `hk_<route UUID>`.
   database, `unit` column first and per-type means where that column is empty.
 - **The phone has to be unlocked.** HealthKit's store is encrypted while the phone is
   locked, and a query then fails. `devicectl` also refuses to launch onto a locked
-  phone, and xcodebuild cannot register or install on one ("needs to be unlocked to
-  enable development services").
+  phone ("the device was not, or could not be, unlocked"), and xcodebuild cannot
+  register or install on one ("needs to be unlocked to enable development services").
+- **A provisional value is replaced, not edited.** The deletion in that incremental
+  run was the morning's resting heart rate: the watch deleted the 61 it had written
+  and wrote 62 at the same instant, under a new UUID. The anchored query delivers
+  that as one deletion plus one new sample, and the rebuild keeps only 62. This is
+  how `daily_metrics` revises a recent day (see the health-sync skill). On this
+  route the old value is gone, not duplicated, but only because deletions are
+  applied. A loader that only appended would keep both.
 
 ### Verdict
 
