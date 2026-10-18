@@ -1,0 +1,9 @@
+// Copy to Local.xcconfig, which git ignores, and fill in your own values.
+//
+// DEVELOPMENT_TEAM is the team id from Xcode -> Settings -> Accounts. It is NOT the
+// ten characters in parentheses after "Apple Development:" in
+// `security find-identity -v -p codesigning`; that one identifies the certificate.
+//
+// A free team needs a bundle id nobody else has registered, so make it yours.
+DEVELOPMENT_TEAM = ABCDE12345
+PRODUCT_BUNDLE_IDENTIFIER = com.yourname.health-export
