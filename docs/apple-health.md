@@ -336,6 +336,19 @@ Reading real boundaries changes numbers. One session's reps turned out to be exa
 4:00 each rather than the 3:50–3:58 the speed detector inferred. **Anything compared
 across sessions has to come from the same method.**
 
+**A workout's totals are in its primary rows only.** `workout_statistics` hangs off
+`workout_activities`, so a structured workout carries one set of statistics for the
+whole session (`is_primary_activity = 1`) and another set per block, each a slice of
+that session. Summing every row counted the session twice. All 14 structured
+workouts in one backup came out with 1.83–2.0× their energy (1,237 kcal where Apple
+has 619), and average heart rate up to 2.5 bpm off, since the blocks were weighted in
+beside the whole. One also got `min_hr` 0, from a block whose minimum was stored as
+0. No unstructured workout changed, because it has primary rows only. The
+converter now aggregates the primary rows and keeps `is_primary` on
+`workout_statistics`, so a query that wants the per-block numbers can still reach
+them. The corrected values were checked against HealthKit's own per-session
+statistics for three of those runs, and they agree to the calorie and to 0.005 bpm.
+
 ### Two traps that cost the most time
 
 - **`device_name` must be the hardware name, not the product type.** The `hr` view
@@ -363,7 +376,10 @@ across sessions has to come from the same method.**
   [christophhagen/HealthDB](https://github.com/christophhagen/HealthDB) and extended
   here. Codes that are neither quantity nor category were identified by which side
   table they join: 79 → `workouts`, 76 → `activity_caches`, 102 → `data_series`
-  (routes), 119 → `binary_samples` (heartbeat series), 144 → `ecg_samples`.
+  (routes), 119 → `binary_samples` (heartbeat series), 144 → `ecg_samples`. Three
+  more were named against a HealthKit export of the same days, where each named type
+  had exactly the code's row count and mean: 275 → `AppleSleepingBreathingDisturbances`,
+  298 → `EstimatedWorkoutEffortScore`, 304 → `WorkoutEffortScore`.
 - `--verify <xml-built.duckdb>` is the acceptance test: quantity and category rows
   without a value, each day's HeartRate count, completeness and mean over the days both
   databases cover, heart-rate series read back against an export that still holds their
