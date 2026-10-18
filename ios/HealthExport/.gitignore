@@ -1,0 +1,5 @@
+# Your team id and bundle id.
+Local.xcconfig
+build/
+HealthExport.xcodeproj/xcuserdata/
+HealthExport.xcodeproj/project.xcworkspace/xcuserdata/

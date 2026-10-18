@@ -8,13 +8,15 @@ Everything runs locally. No account, no server, no upload.
 
 ```
 Health app export (XML)  ─┐
-                          ├─→  DuckDB  ─→  reports, SQL, per-rep interval analysis
-encrypted iPhone backup  ─┘
+encrypted iPhone backup  ─┼─→  DuckDB  ─→  reports, SQL, per-rep interval analysis
+HealthKit, via an app    ─┘
 ```
 
-Both ingestion routes build the same views, so the analysis scripts run unchanged
-against either. The XML route needs nothing but Python; the backup route can run
-unattended but needs pairing and the backup password.
+All three ingestion routes build the same views, so the analysis scripts run
+unchanged against any of them. The XML route needs nothing but Python. The backup
+route can run unattended but needs pairing and the backup password. The HealthKit
+route needs Xcode and a small app on the phone ([`ios/HealthExport`](ios/HealthExport/README.md)),
+and then syncs incrementally in seconds with no backup at all.
 
 ## Why not just read the Fitness app
 
@@ -97,6 +99,7 @@ Only that template is tracked by git; your own profile is ignored.
 |---|---|
 | `health_to_duckdb.py` | XML export → DuckDB, including GPS routes |
 | `healthdb_to_duckdb.py` | iPhone backup → DuckDB, with structured workout blocks |
+| `healthkit_to_duckdb.py` | the HealthExport app's files → DuckDB, same tables and blocks |
 | `parse_health_export.py` | XML export → CSVs, stdlib only, no dependencies at all |
 | `extract_hr_samples.py` | the per-sample heart-rate stream for given days |
 | `hq.py` | read-only SQL over the database |
@@ -120,7 +123,7 @@ Only that template is tracked by git; your own profile is ignored.
 
 - **`analyze_intervals.py` does not work on an XML-built database.** It needs
   `workout_blocks`, the watch's own block boundaries, and Apple's XML export does not
-  carry them. That table only exists on the backup route.
+  carry them. The backup and HealthKit routes both have them.
 - **Apple's `Segment` events are not laps.** They tile the whole session end to end
   and mean nothing.
 - **Weather in `workout_metadata` is a service lookup, not a sensor.** It is present

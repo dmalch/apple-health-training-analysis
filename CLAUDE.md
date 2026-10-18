@@ -5,9 +5,10 @@ Guidance for Claude Code working in this repository.
 ## What this is
 
 Scripts that turn an Apple Health export into a queryable DuckDB database and a
-training-load report. Two ingestion routes — an XML export from the Health app, and
-an encrypted iPhone backup — converge on the same views, so the analysis scripts run
-unchanged against either.
+training-load report. Three ingestion routes — an XML export from the Health app, an
+encrypted iPhone backup, and HealthKit read by the small iOS app in `ios/HealthExport`
+— converge on the same views, so the analysis scripts run unchanged against any of
+them.
 
 There is no package and nothing to install. The scripts are run out of a clone.
 

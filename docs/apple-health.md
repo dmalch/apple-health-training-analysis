@@ -13,7 +13,7 @@ synced to a Mac in any readable form:
 - there is no HealthKit database anywhere under `~/Library`
 - iCloud syncs Health end-to-end encrypted; no Mac-side container holds it
 
-So the data has to leave the phone deliberately. There are two ways.
+So the data has to leave the phone deliberately. There are three ways.
 
 ## Route 1: the XML export
 
@@ -428,6 +428,125 @@ statistics for three of those runs, and they agree to the calorie and to 0.005 b
   to about 1 bpm, and on travel days for hours at a stretch, where a pair of adjacent
   days swings by hundreds in opposite directions. Over one ten-day trip both databases
   held the same 5,814 instants and filed 2,850 of them under a different day.
+
+## Route 3: HealthKit, through an app of your own
+
+**Nothing outside the phone can read Health — not Xcode, not `devicectl`, not a
+paired Mac.** Xcode's device tools see only the containers of apps you installed
+yourself. What *can* read it is an app on the phone that holds the HealthKit
+entitlement and that the user has allowed to read, and a free Apple ID can sign one
+for its own phone. `ios/HealthExport/` is that app: it pulls every type through
+`HKAnchoredObjectQuery`, writes JSONL into its Documents folder, and
+`healthkit_to_duckdb.py` builds the usual database from the files. Setup, the 7-day
+signing limit and the layout are in `ios/HealthExport/README.md`.
+
+What it fixes is the backup's cost, not its content. On iOS 27 the scripted backup
+died on the on-phone passcode prompt every time (see the health-sync skill), so a
+sync meant Finder, the passcode and a full backup. Through HealthKit, each type
+resumes from a saved anchor, and a run with nothing new took 10 s end to end. The
+first 30 days took 58 s: 273k samples, 19 workouts, 39k route points. Half an hour
+later an incremental run took 14 s and brought exactly what was new: 23 samples
+none of the earlier batches held, and one deletion.
+
+### Measured against the backup route
+
+On 18 Oct 2026 (iOS 27.0.1, an Apple Watch and a chest strap), a 30-day
+export was compared with a backup-built database taken six days earlier, over the 24
+whole days both cover (`healthkit_to_duckdb.py --compare`):
+
+- **Every type the analysis reads matched in count and mean**: heart rate 87,660
+  readings against 87,660, and strap, watch and AirPods each identical in count and
+  maximum. The same held for energy, distance, steps, running dynamics, HRV, resting
+  heart rate, VO2 max, sleep and stand hours. `daily_metrics` and
+  `hr_sources_by_day` agreed on every day, to float summation order.
+- **All 16 workouts matched on start time and are identical** in duration,
+  distance, energy, heart rate, indoor flag, route points, events and blocks, a half
+  marathon and the gym classes among them.
+- **`analyze_intervals.py` printed the same report from both** for four sessions,
+  two of them structured: every rep, every split, the sensor audit, the zones. Only
+  the route's name differs.
+- **That held only after this comparison found a backup-route bug.** At first the
+  three structured runs differed: the backup side had double the energy (1,237 kcal
+  against 619, 682 against 372, 208 against 104), an average heart rate of its own
+  (134.51 where Apple says 135.74), and on one run a `min_hr` of 0. That converter
+  summed `workout_statistics` over a structured workout's primary activity *and* its
+  blocks, so it counted the session twice. It now reads the primary rows only
+  (*Structured-workout blocks*, above), and its numbers equal HealthKit's
+  per-session statistics.
+- Two samples were only in the HealthKit database, a weekly walking-steadiness value
+  and one sound-reduction reading. Both were written to the phone after the backup
+  was taken, so the HealthKit side was simply newer.
+
+### What it gains and loses
+
+Gains over the backup route: the Activity rings (`activity_summary`, an empty stub
+there); the beat times of every heartbeat series (`heartbeat_points`, 17,497 beats in
+30 days, decoded by neither other route); and data as fresh as the last sync
+rather than the last backup. It also named three codes the backup route had left as
+`type_<n>`, by identical counts and means: 275, 298 and 304, now named there too.
+
+What HealthKit does not hand out, over those 24 days:
+
+| Backup type | Rows | Source | What it is |
+|---|---:|---|---|
+| `type_285` | 80 | Apple Watch | an instantaneous quantity, mean 0.23 — unidentified |
+| `type_116` | 35 | Apple Watch | a category valued 0/1 — unidentified |
+| `type_273` | 24 | Medications app | dose events; iOS 26's medication API needs per-object authorization, not attempted |
+| `EnvironmentalAudioExposureEvent` (178) | 23 | Apple Watch | the type is requested and came back empty; read permission not ruled out |
+| `type_77` | 20 | iPhone | day-long rows in no side table |
+| `type_109`, `type_108` | 15, 9 | iPhone | no value |
+| `type_198` | 7 | Clock | no value |
+| `ActivitySummary` (76) | 24 | — | the rings as rows of `records`; here they are `activity_summary` instead |
+
+Nothing the scripts read is among them.
+
+Also different by design: `id` is the first 60 bits of the sample's UUID, because
+HealthKit has no row numbers, so **ids do not carry between the two databases** —
+match workouts on start time. `creation_date` is NULL, because HealthKit does not
+expose it. `route_file` is `hk_<route UUID>`.
+
+### Traps
+
+- **The heart-rate series come back exactly as the backup holds them.**
+  `HKQuantitySeriesSampleQuery` returns the same run-length-encoded points, each a
+  `DateInterval` whose duration covers a run of identical readings. The same
+  expansion `healthdb_to_duckdb.build_series_points` applies yields the same readings:
+  the 87,660 above include them.
+- **The interval plan is public.** `WOIntervalStepKeyPath` passes through
+  `HKWorkoutActivity.metadata` unchanged, and WorkoutKit's `HKWorkout.workoutPlan`
+  returns the plan, so blocks get their kind, goal and pace target exactly as on the
+  backup route, key paths and all. The one naming difference was the app's: a
+  `SpeedThresholdAlert` was first written as `instantaneous_pace_threshold`, while the
+  backup route writes a threshold as `instantaneous_pace` with equal ends. It now
+  writes the same.
+- **The anchored query takes every sample that *overlaps* its start date**, so a
+  first pull from midnight also returns a few samples from the evening before.
+  Comparing from the earliest sample made that partial day read as a 3–5% shortfall
+  in every type. Compare from the export's `since`, as `--compare` does.
+- **Units are chosen, not inherited.** HealthKit converts to any compatible unit on
+  request, so the app asks for the database's display units directly and there is no
+  `UNIT_SCALE`. The table in `HealthTypes.swift` was read off the backup-built
+  database, `unit` column first and per-type means where that column is empty.
+- **The phone has to be unlocked.** HealthKit's store is encrypted while the phone is
+  locked, and a query then fails. `devicectl` also refuses to launch onto a locked
+  phone ("the device was not, or could not be, unlocked"), and xcodebuild cannot
+  register or install on one ("needs to be unlocked to enable development services").
+- **A provisional value is replaced, not edited.** The deletion in that incremental
+  run was the morning's resting heart rate: the watch deleted the 61 it had written
+  and wrote 62 at the same instant, under a new UUID. The anchored query delivers
+  that as one deletion plus one new sample, and the rebuild keeps only 62. This is
+  how `daily_metrics` revises a recent day (see the health-sync skill). On this
+  route the old value is gone, not duplicated, but only because deletions are
+  applied. A loader that only appended would keep both.
+
+### Verdict
+
+Use it for the regular sync. It matched the backup route on everything the
+analysis reads, and it replaces a manual Finder backup with one command. Keep the backup route
+for two things. One is history: the app reads back only as far as `--days` on its
+first or `--full` run, and a pull of the whole history, several million samples, has
+not been tried. The other is the handful of private types above. An expired 7-day
+profile fails at launch, loudly, so it cannot go stale unnoticed.
 
 ## Parsing the XML
 

@@ -1,0 +1,9 @@
+// Signing for HealthExport. Your own team and bundle id go in Local.xcconfig next
+// to this file, which git ignores: copy Local.xcconfig.example and fill it in. A
+// free Apple ID's "Personal Team" is enough -- HealthKit is available to it -- but
+// its provisioning profile lasts 7 days, after which the app no longer launches
+// until it is built and installed again.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.health-export
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

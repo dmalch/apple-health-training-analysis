@@ -20,6 +20,11 @@ This route is optional. The XML-export route (`health_to_duckdb.py`) needs no
 pairing, no trust and no encryption password, and is the right starting point for
 most people. See the README.
 
+**There is now a third route that needs no backup at all**: the HealthExport app
+reads Health through HealthKit and the Mac copies its files off. On 18 Oct 2026 it
+matched the backup route on everything the analysis reads (`docs/apple-health.md`,
+*Route 3*). See *The HealthKit route* at the end of this file.
+
 ## The one command
 
 ```bash
@@ -250,3 +255,40 @@ fixing before the second phone ever appears.
 
 Write it back — a new gotcha into this file, a measured fact into the docs. Findings
 should not stay in the transcript.
+
+## The HealthKit route
+
+```bash
+${CLAUDE_SKILL_DIR}/scripts/sync_healthkit.sh --profile NAME            # incremental
+${CLAUDE_SKILL_DIR}/scripts/sync_healthkit.sh --profile NAME --full --days 30
+```
+
+The script launches the HealthExport app on the phone with `-autoExport YES`, waits
+for it to quit, copies `Documents/batches/` off and rebuilds
+`<data_dir>/health-hk.duckdb` from every batch. Add `--compare <backup-built db>`
+to diff the two. Setup is in `ios/HealthExport/README.md`. Things that cost time on
+the first run, 18 Oct 2026:
+
+- **Developer Mode is not on until the prompt after the restart is confirmed.** The
+  switch in Settings looks on, but `devicectl device info details` reports
+  `developerModeStatus: disabled` and xcodebuild says "Developer Mode disabled". After
+  the restart, unlock the phone and tap *Turn On* in the prompt.
+- **Build against the phone, not `generic/platform=iOS`.** The generic build signs
+  cleanly, but a free team's profile then lists only the Mac, and the app will not
+  run on the phone. The device build registers the phone, and it waits for the phone
+  to be unlocked: without `-destination-timeout` it gives up with "needs to be
+  unlocked to enable development services".
+- **The first launch fails until the developer is trusted on the phone** (Settings →
+  General → VPN & Device Management). The error names "invalid code signature,
+  inadequate entitlements or its profile has not been explicitly trusted", and the
+  last of those is the one.
+- **The free profile expires after 7 days**, and then the launch fails. Rebuild and
+  reinstall; the batches and anchors survive a reinstall.
+- **The phone must stay unlocked for the whole run.** HealthKit cannot be read while
+  the phone is locked, and `devicectl` will not launch onto a locked phone.
+- **A run with nothing new still writes a batch**, holding the Activity rings, which
+  are re-read in full every time. That is expected, not a stuck anchor.
+- **`device_udid` is required here too.** The script passes it to `devicectl` as the
+  only phone it may talk to, so a second phone on the cable is never read into this
+  profile.
+
