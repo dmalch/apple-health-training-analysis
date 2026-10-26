@@ -7,7 +7,10 @@ struct HealthExportApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(model: model)
-                .task { await model.runIfLaunchedToExport() }
+                .task {
+                    await model.reload()
+                    await model.runIfLaunchedToExport()
+                }
         }
     }
 }
@@ -16,6 +19,8 @@ struct HealthExportApp: App {
 final class ExportModel: ObservableObject {
     @Published private(set) var lines: [String] = []
     @Published private(set) var running = false
+    @Published private(set) var lastResult: Bool?
+    @Published private(set) var dashboard = Dashboard()
     @Published var firstPullDays = 30
 
     private lazy var exporter = Exporter(documents: Self.documents) { line in
@@ -27,6 +32,11 @@ final class ExportModel: ObservableObject {
     var stateSummary: String {
         guard let state = exporter.loadState() else { return "No export yet: the first one reads \(firstPullDays) days." }
         return "Incremental since \(state.since.formatted(date: .abbreviated, time: .omitted)), \(state.anchors.count) anchors."
+    }
+
+    func reload() async {
+        let documents = Self.documents
+        dashboard = await Task.detached { Dashboard.load(documents: documents) }.value
     }
 
     /// `-autoExport YES` on the launch command line, as the Mac's sync script
@@ -50,15 +60,19 @@ final class ExportModel: ObservableObject {
         guard !running else { return false }
         running = true
         defer { running = false }
+        let ok: Bool
         do {
             try await exporter.authorize()
             let batch = try await exporter.run(firstPullDays: firstPullDays)
             append("EXPORT DONE \(batch)")
-            return true
+            ok = true
         } catch {
             append("EXPORT FAILED: \(error.localizedDescription)")
-            return false
+            ok = false
         }
+        lastResult = ok
+        await reload()
+        return ok
     }
 
     func resetAnchors() {
