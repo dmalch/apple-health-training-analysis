@@ -114,5 +114,8 @@ re-read costs time, not correctness.
 | `HealthExport/PlanEncoder.swift` | a WorkoutKit plan as the columns `workout_blocks` carries |
 | `HealthExport/JSONL.swift` | the writer, and HealthKit values made JSON-safe |
 | `HealthExport/HealthExportApp.swift` | the model, and the `-autoExport` launch path |
+| `HealthExport/ContentView.swift` | the screen: signature countdown, export button, a week of rings, recent workouts, batches, log |
+| `HealthExport/Dashboard.swift` | what that screen shows, read back from the batches already written, never from HealthKit |
+| `icon/make_icon.swift` | renders `Assets.xcassets/AppIcon.appiconset/AppIcon.png` |
 | `Signing.xcconfig` | tracked defaults; includes your gitignored `Local.xcconfig` |
 | `HealthExport.xcodeproj` | hand-written, Xcode 16 format with a synchronized folder |
