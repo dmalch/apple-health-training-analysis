@@ -1,5 +1,5 @@
 # Core: the XML-export route and every analysis script.
-duckdb==1.5.6
+duckdb==2.0.0
 
 # Not imported anywhere in this project, and not removable for that reason:
 # duckdb itself imports pytz when it converts a TIMESTAMPTZ value back into
